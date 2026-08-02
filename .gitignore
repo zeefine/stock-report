@@ -1,0 +1,26 @@
+# Python-generated files
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info
+
+# macOS and IDE metadata
+.DS_Store
+.idea/
+
+# Virtual environments
+.venv
+
+# Local secrets and generated report artifacts
+.env
+runs/
+reports/
+
+# Pre-migration prompts and HTML templates retained locally
+/A股收盘日报_prompt_优化版.md
+/美股收盘日报_prompt_优化版.md
+/A股收盘日报_template.html
+/美股收盘日报_template.html
+/项目从Prompt到代码流水线_复盘总结.md

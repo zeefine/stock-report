@@ -1,0 +1,23 @@
+<!doctype html>
+<html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>美股收盘日报｜{{REPORT_DATE_ET}}</title>
+<style>
+:root{--ink:#172033;--muted:#687386;--line:#dfe4ec;--paper:#fff;--bg:#f4f6f9;--accent:#163f73;--up:#16805b;--down:#c53d36}*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--ink);font:14px/1.65 system-ui,-apple-system,"PingFang SC",sans-serif}main{max-width:1120px;margin:auto;padding:28px 18px 64px}header,section{background:var(--paper);border:1px solid var(--line);border-radius:8px;padding:22px;margin:0 0 14px}h1{font-size:29px;margin:0}h2{font-size:19px;margin:0 0 14px;border-left:4px solid var(--accent);padding-left:10px}h3{font-size:15px}.lead{font-size:16px}.meta,.grid,.decision-grid{display:grid;gap:10px}.meta{grid-template-columns:repeat(3,1fr);color:var(--muted)}.grid{grid-template-columns:repeat(2,1fr)}.decision-grid{grid-template-columns:repeat(4,1fr)}.metric-grid{display:grid;grid-template-columns:repeat(4,1fr);gap:10px;margin-top:18px}.metric,.decision,.card{border:1px solid var(--line);border-radius:6px;padding:12px}.metric small,.decision small{display:block;color:var(--muted)}.metric strong,.decision strong{font-size:18px}.scroll{overflow:auto}table{width:100%;border-collapse:collapse;white-space:nowrap}th,td{padding:9px 10px;border-bottom:1px solid var(--line);text-align:right}th{background:#f7f9fc;color:var(--muted);font-weight:600}th:first-child,td:first-child{text-align:left}.up{color:var(--up)}.down{color:var(--down)}.muted,.note{color:var(--muted)}.tag,.status{display:inline-block;background:#edf3fa;color:var(--accent);border-radius:4px;padding:2px 7px}code{white-space:normal;word-break:break-all}@media(max-width:760px){.meta,.grid,.decision-grid,.metric-grid{grid-template-columns:1fr 1fr}main{padding:10px}header,section{padding:15px}}@media print{body{background:#fff}main{max-width:none}header,section{break-inside:avoid}}
+</style></head><body><main>
+<header><h1>美股收盘日报</h1><p class="lead">{{REPORT_DATE_ET}} · {{MARKET_PHASE}}</p><div class="meta"><span>生成：{{GENERATED_AT_SHANGHAI}}</span><span>截至：{{DATA_AS_OF}}</span><span>口径：{{SESSION_SCOPE}}</span></div><div class="metric-grid"><div class="metric"><small>SPY</small><strong>{{SPY_CLOSE}}</strong>{{SPY_CHANGE}}</div><div class="metric"><small>QQQ</small><strong>{{QQQ_CLOSE}}</strong>{{QQQ_CHANGE}}</div><div class="metric"><small>美国10Y</small><strong class="{{US10Y_CLASS}}">{{US10Y_VALUE}}</strong>{{US10Y_CHANGE}}</div><div class="metric"><small>VIX</small><strong>{{VIX_VALUE}}</strong>{{VIX_CHANGE}}</div></div></header>
+<section><h2>1. 执行摘要</h2><div class="decision-grid">{{FIRST_READ_HTML}}</div>{{EXECUTIVE_SUMMARY_HTML}}<p class="status"><strong>市场状态：</strong>{{MARKET_STATUS}}</p></section>
+<section><h2>2. 市场概览</h2><div class="scroll">{{MARKET_OVERVIEW_TABLE_HTML}}</div>{{RISK_APPETITE_HTML}}</section>
+<section><h2>3. 盘中节奏与核心驱动</h2>{{INTRADAY_TIMELINE_HTML}}{{DRIVER_TRANSMISSION_HTML}}</section>
+<section><h2>4. 宏观与跨资产</h2><div class="grid"><div class="card"><h3>美债曲线</h3><div class="scroll">{{TREASURY_TABLE_HTML}}</div></div><div class="card"><h3>跨资产</h3><div class="scroll">{{CROSS_ASSET_TABLE_HTML}}</div></div></div>{{MACRO_EVENTS_HTML}}</section>
+<section><h2>5. 板块与主题</h2><div class="scroll">{{SECTOR_ROTATION_TABLE_HTML}}</div>{{THEME_ROTATION_HTML}}{{SECTOR_TRANSMISSION_HTML}}</section>
+<section><h2>6. 市场宽度代理</h2><div class="scroll">{{BREADTH_PROXY_TABLE_HTML}}</div></section>
+<section><h2>7. 技术面</h2><div class="scroll">{{TECHNICAL_TABLE_HTML}}</div>{{TECHNICAL_COMMENTARY_HTML}}</section>
+<section><h2>8. 异动扫描与重点个股</h2>{{IDEA_FUNNEL_HTML}}<div class="scroll">{{MOVERS_TABLE_HTML}}</div></section>
+<section><h2>9. 财报与公司事件</h2><div class="scroll">{{EARNINGS_RECAP_TABLE_HTML}}</div><h3>未来财报</h3><div class="scroll">{{EARNINGS_CALENDAR_TABLE_HTML}}</div>{{EARNINGS_ANALYSIS_HTML}}</section>
+<section><h2>10. 期权、做空与申报信号</h2>{{POSITIONING_SIGNALS_HTML}}{{EVENT_ANALYSIS_HTML}}</section>
+<section><h2>11. UZI 重点研究候选</h2>{{UZI_CANDIDATES_HTML}}</section>
+<section><h2>12. 中国与香港联动</h2>{{CHINA_HK_LINKAGE_HTML}}</section>
+<section><h2>13. 下一交易日情景</h2><div class="scroll">{{SCENARIO_TABLE_HTML}}</div>{{NEXT_SESSION_WATCHLIST_HTML}}</section>
+<section><h2>14. 最终结论</h2>{{FINAL_CONCLUSION_HTML}}<div class="card"><div class="scroll">{{SECTOR_SUMMARY_HTML}}</div></div><div class="grid"><div class="card"><span class="tag">市场阶段</span><p><strong>{{MARKET_STAGE}}</strong></p></div><div class="card">{{POSITIONING_BIAS_HTML}}</div></div>{{VALIDATION_SIGNALS_HTML}}</section>
+<section><h2>数据质量与来源</h2>{{EVIDENCE_LIMITATIONS_HTML}}{{SOURCES_HTML}}</section>
+</main></body></html>

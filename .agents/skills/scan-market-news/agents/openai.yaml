@@ -1,0 +1,4 @@
+interface:
+  display_name: "市场新闻扫描"
+  short_description: "抓取并整理三地市场RSS新闻，输出结构化数据和可视化页面"
+  default_prompt: "使用 $scan-market-news 扫描最近一个交易日的市场新闻，校验输出并生成自包含HTML页面。"

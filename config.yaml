@@ -1,0 +1,30 @@
+{
+  "project": {
+    "runs_dir": "runs",
+    "reports_dir": "reports",
+    "prompts_dir": "prompts",
+    "templates_dir": "templates"
+  },
+  "pipeline": {
+    "llm_enabled": false,
+    "fail_on_unresolved_placeholders": true,
+    "write_manifest": true
+  },
+  "markets": {
+    "cn": {
+      "timezone": "Asia/Shanghai",
+      "template": "cn_close.html",
+      "prompt": "cn.md"
+    },
+    "us": {
+      "timezone": "America/New_York",
+      "template": "us_close.html",
+      "prompt": "us.md"
+    },
+    "hk": {
+      "timezone": "Asia/Hong_Kong",
+      "template": "hk_close.html",
+      "prompt": "hk.md"
+    }
+  }
+}
