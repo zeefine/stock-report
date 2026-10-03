@@ -48,8 +48,9 @@ def cn_close_minute_checks(symbols: dict, quotes: dict, report_date: str) -> dic
         price = quote.get("price") if isinstance(quote, dict) else None
         error = (abs(final["close"] / price - 1) * 100
                  if final and finite_number(price) and price > 0 else None)
-        checks[symbol] = {"valid": set(valid_rows) == expected and len(rows) == 48
-                         and error is not None and error <= 0.2,
+        complete = set(valid_rows) == expected and len(rows) == 48
+        checks[symbol] = {"complete": complete,
+                         "valid": complete and error is not None and error <= 0.2,
                          "bars": len(rows), "close_error_pct": error}
     return checks
 

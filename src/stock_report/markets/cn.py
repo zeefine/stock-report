@@ -260,12 +260,25 @@ def collect_intraday_klines(
 ) -> dict:
     cache = data_dir / "minute_indices.json"
     old = read_json_file(cache, {})
+    old = old if isinstance(old, dict) else {}
+    cached_symbols = old.get("symbols")
+    if (refresh or old.get("report_date") != report_date
+            or old.get("interval", "5m") != "5m" or not isinstance(cached_symbols, dict)):
+        cached_symbols = {}
     now = datetime.now(SH_TZ)
-    reusable = mode == "close" or _cache_fresh(cache, cache_seconds, now)
-    if not refresh and reusable and old.get("report_date") == report_date and old.get("symbols"):
-        return _truncate_intraday_pack(old, as_of if mode == "intraday" else None, "symbols")
+    if mode == "intraday" and cached_symbols and _cache_fresh(cache, cache_seconds, now):
+        return _truncate_intraday_pack(old, as_of, "symbols")
+    # Cache completeness is independent of quote agreement (checked at QC).
+    # Retain complete symbols, but retry failed/partial symbols on every close run.
+    complete = cn_close_minute_checks(cached_symbols, {}, report_date) if mode == "close" else {}
+    if complete and all(check["complete"] for check in complete.values()):
+        return {**old, "symbols": {s: sorted(cached_symbols[s], key=lambda r: cn_timestamp(r["time"]))
+                                    for s in INTRADAY_INDEXES}}
     symbols = {}
     for symbol in INTRADAY_INDEXES:
+        if complete.get(symbol, {}).get("complete"):
+            symbols[symbol] = sorted(cached_symbols[symbol], key=lambda r: cn_timestamp(r["time"]))
+            continue
         rows = [x for x in minute_kline(symbol) if x["time"][:10] == report_date]
         if mode == "intraday" and as_of is not None:
             rows = [x for x in rows if datetime.fromisoformat(x["time"]) <= as_of]
@@ -471,7 +484,16 @@ def pool(endpoint, date_str):
     params={"ut":"7eea3edcaed734bea9cbfc24409ed989","dpt":"wz.ztzt","Pageindex":0,"pagesize":10000,"sort":"fbt:asc","date":date_str.replace("-","")}
     try:
         d=get_json(url,params=params,headers={"Referer":"https://quote.eastmoney.com/"},timeout=15)
-        return ((d.get("data") or {}).get("pool") or [])
+        if not isinstance(d, dict) or type(d.get("rc")) is not int or d["rc"] != 0:
+            return None
+        data = d.get("data")
+        rows = data.get("pool") if isinstance(data, dict) else None
+        if not isinstance(rows, list) or any(
+            not isinstance(row, dict) or not re.fullmatch(r"\d{6}", str(row.get("c", "")))
+            for row in rows
+        ):
+            return None
+        return rows  # An explicitly successful empty pool is a real zero.
     except Exception:
         return None
 
