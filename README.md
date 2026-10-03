@@ -104,6 +104,10 @@ A 股指定 `--as-of` 时，报价必须有同日报告时段内且不晚于截�
 核心检查失败时 `quality.passed=false`，CLI 返回退出码2；新闻事件不足只降级对应章节。
 校验会读取实际 `minute_indices.json`，不会仅相信证据中声明的覆盖率或成功标志。
 
+盘中分钟线按报告日、截止时间和交易时段的完整五分钟网格核验，重复、缺口、乱序和非网格时间不能用于凑足覆盖率。
+事件反应只在完整30分钟窗口后计算；尚未完成的窗口保留在对齐结果中，标记“窗口待完成或数据不足”，不输出正式30分钟收益或同步评级。
+非五分钟整点事件使用向下取整的价格窗口，并记录实际起止时间；不跨午休或收盘拼接窗口。
+
 A 股跨市场参考从配置的 `runs_dir/us/` 中选择截至报告时间已经收盘的美股日线，
 按美东交易日历处理周末、常规休市日和提前收盘日（[NYSE日历](https://www.nyse.com/trade/hours-calendars)）。
 表格显示各资产实际数据日期；缺少最近交易日数据时，旧数据明确标记为“过期参考”，
@@ -123,11 +127,40 @@ stock-report validate --market cn --date 2026-08-03 --mode intraday
 stock-report validate --market us --date 2026-07-31
 ```
 
+A 股盘中校验从指定日期的 `intraday_latest/manifest.json` 定位页面，不使用跨日期的 `A股盘中快报_latest.html`。
+清单、证据和 HTML 元数据中的报告日与截止时间必须一致；清单或证据缺失会阻断校验。
+旧盘中页面若没有日期和截止时间元数据，需要重新生成后再校验。
+
 查看完整帮助：
 
 ```bash
 stock-report --help
 ```
+
+### 美股离线重渲染
+
+渲染函数只消费已保存的证据和新闻，不会联网补数，也不依赖先前运行设置的全局日期：
+
+```python
+import json
+from pathlib import Path
+from stock_report.markets.us import render
+from stock_report.news import load_news_events
+
+run_dir = Path("runs/us/2026-07-31")
+evidence = json.loads((run_dir / "market_data/evidence.json").read_text(encoding="utf-8"))
+render(
+    evidence,
+    load_news_events(run_dir / "news"),
+    template=Path("templates/us_close.html"),
+    output=Path("reports/美股收盘日报_2026-07-31.html"),
+)
+```
+
+证据必须包含 `report_date`；技术指标剔除晚于该日期的日K，旧交易日价格不能充当报告日行情。
+生成时间、截止说明和日历优先使用证据中的 `generated_at`、`as_of`、`calendar_dates`。
+市场方向要求 SPY、QQQ、DIA、IWM、RSP 五项有效收益；板块强弱比较要求至少6个板块ETF的有效报告日收益。
+覆盖不足时不作方向或排名判断；收益相同不按配置顺序选出强弱，缺失收益不以零替代。
 
 ## 项目结构
 

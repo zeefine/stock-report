@@ -10,7 +10,7 @@ from .common import (
     cn_session_state, first_existing, load_config, now_in, parse_as_of, project_root,
     resolve_report_mode, validate_date,
 )
-from .models import Market, PipelineResult, ReportMode, RunContext
+from .models import Market, PipelineResult, ReportMode, RunContext, QualityIssue, QualityResult
 from .quality import validate_report
 
 
@@ -164,11 +164,25 @@ def validate_existing(
     context = build_context(
         market, report_date, mode=mode, root=root, config_path=config_path
     )
+    expected_as_of = None
     if market == "cn" and context.mode == "intraday":
-        report_path = context.reports_dir / "A股盘中快报_latest.html"
+        manifest_path = context.market_run_dir(report_date) / "manifest.json"
+        try:
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            if (not isinstance(manifest, dict) or manifest.get("market") != market
+                    or manifest.get("mode") != "intraday" or manifest.get("report_date") != report_date
+                    or not isinstance(manifest.get("report_path"), str) or not manifest["report_path"]
+                    or not isinstance(manifest.get("as_of"), str) or not manifest["as_of"]):
+                raise ValueError("清单缺少必要信息或日期/市场/模式不匹配")
+            report_path = Path(manifest["report_path"])
+            if not report_path.is_absolute():
+                report_path = context.root / report_path
+            expected_as_of = manifest["as_of"]
+        except (OSError, ValueError) as exc:
+            return QualityResult(False, [QualityIssue("intraday_manifest_invalid", f"无法定位指定盘中报告：{exc}")])
     else:
         suffix = "_Asia-Shanghai" if market == "cn" else ""
         prefix = "A股收盘日报" if market == "cn" else "美股收盘日报"
         report_path = context.reports_dir / f"{prefix}_{report_date}{suffix}.html"
     return validate_report(report_path, _evidence_path(context, report_date),
-                           market=context.market, mode=context.mode, report_date=report_date)
+                           market=context.market, mode=context.mode, report_date=report_date, as_of=expected_as_of)

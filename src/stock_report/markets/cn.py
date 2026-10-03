@@ -17,7 +17,7 @@ from stock_report.analysis import cn_market_assessment
 from stock_report.render import html_table as _shared_html_table, render_template
 from stock_report.common import (
     cn_session_state, cn_timestamp, cn_close_quote_errors, cn_close_minute_checks, cn_close_price_mismatches,
-    CN_MINUTE_INDEXES, finite_number, latest_completed_us_session, us_session_close,
+    CN_MINUTE_INDEXES, finite_number, latest_completed_us_session, us_session_close, cn_minute_rows_complete,
 )
 
 ROOT = Path(__file__).resolve().parents[3]
@@ -623,18 +623,18 @@ def intraday_quality(
     close_checks = cn_close_minute_checks(minute_pack.get("symbols") or {}, quotes, report_date) if mode == "close" else {}
     for symbol in INTRADAY_INDEXES:
         rows = _rows_for_symbol(minute_pack, symbol)
-        first = rows[0]["minute"] if rows else ""
-        last = rows[-1]["minute"] if rows else ""
+        rows = rows if isinstance(rows, list) else []
+        first_time = cn_timestamp(rows[0].get("time")) if rows and isinstance(rows[0], dict) else None
+        last_time = cn_timestamp(rows[-1].get("time")) if rows and isinstance(rows[-1], dict) else None
+        first = first_time.strftime("%H:%M") if first_time else ""
+        last = last_time.strftime("%H:%M") if last_time else ""
         quote_close = (quotes.get(symbol) or {}).get("price")
-        minute_close = rows[-1]["close"] if rows else None
-        close_error = abs(pct(minute_close, quote_close) or 0) if minute_close and quote_close else None
+        minute_close = rows[-1].get("close") if rows and isinstance(rows[-1], dict) else None
+        close_error = abs(pct(minute_close, quote_close) or 0) if finite_number(minute_close) and finite_number(quote_close) and quote_close > 0 else None
         if mode == "close":
             ok = close_checks[symbol]["valid"]
         else:
-            ok = bool(
-                minimum_bars > 0 and len(rows) >= minimum_bars
-                and first <= "09:35" and required_end and last >= required_end
-            )
+            ok = cn_minute_rows_complete(rows, expected_bars)
         valid += int(ok)
         checks[symbol] = {
             "bars": len(rows), "first": first or None, "last": last or None,
@@ -690,37 +690,58 @@ def _event_scope(title: str) -> str:
         return "market_observation"
     return "company_or_other"
 
+def _event_window(rows: list, published: datetime, cutoff: datetime | None):
+    """Use a complete 30-minute five-minute-grid proxy, never a partial endpoint."""
+    start = published.replace(minute=published.minute // 5 * 5, second=0, microsecond=0)
+    end = start + timedelta(minutes=30)
+    valid = [(cn_timestamp(row.get("time")), row) for row in rows if isinstance(row, dict)]
+    valid = [(stamp, row) for stamp, row in valid
+             if stamp and stamp.date() == published.date() and (cutoff is None or stamp <= cutoff)]
+    expected = [start + timedelta(minutes=5 * i) for i in range(7)]
+    window_rows = [row for stamp, row in valid if start <= stamp <= end]
+    session_grid = set(_expected_cn_bars(published.date().isoformat(), end))
+    complete = (bool(valid) and max(stamp for stamp, _ in valid) >= published + timedelta(minutes=30)
+                and set(expected).issubset(session_grid)
+                and cn_minute_rows_complete(window_rows, expected))
+    observed_end = max((stamp for stamp, _ in valid if start <= stamp <= end), default=None)
+    info = {"complete": complete, "actual_start": start.isoformat(),
+            "actual_end": observed_end.isoformat() if observed_end else None,
+            "observed_minutes": (observed_end - start).total_seconds() / 60 if observed_end else 0}
+    if not complete:
+        return None, None, info
+    move = pct(window_rows[-1]["close"], window_rows[0]["close"])
+    before_times = [start - timedelta(minutes=5 * i) for i in reversed(range(6))]
+    before = [row for stamp, row in valid if before_times[0] <= stamp <= start]
+    after = window_rows[1:]
+    ratio = None
+    if (set(before_times).issubset(session_grid) and cn_minute_rows_complete(before, before_times)
+            and all(finite_number(row.get("volume_lots")) and row["volume_lots"] >= 0 for row in before + after)):
+        before_sum = sum(row["volume_lots"] for row in before)
+        ratio = sum(row["volume_lots"] for row in after) / before_sum if before_sum else None
+    return move, ratio, info
+
+
 def align_intraday_events(minute_pack: dict, events_pack: dict) -> list[dict]:
     """衡量快讯发布后30分钟的同步行情；结果只表示时间对齐，不表示因果。"""
     aligned = []
     for event in events_pack.get("events") or []:
         if not event.get("a_share_relevant"):
             continue
-        try:
-            published = datetime.fromisoformat(event["published_at"])
-        except Exception:
+        published = cn_timestamp(event.get("published_at"))
+        if published is None:
             continue
-        end = published + timedelta(minutes=30)
-        moves = {}
+        moves, windows = {}, {}
+        volume_ratio = None
         for symbol in ("sh000001", "sh000300", "sz399006", "sh000688"):
             rows = _rows_for_symbol(minute_pack, symbol)
-            base = _row_at_or_before(rows, published)
-            after = _row_at_or_before(rows, end)
-            moves[symbol] = pct(after["close"], base["close"]) if base and after else None
-        sse_rows = _rows_for_symbol(minute_pack, "sh000001")
-        event_idx = next(
-            (i for i, x in enumerate(sse_rows) if datetime.fromisoformat(x["time"]) >= published),
-            None,
-        )
-        volume_ratio = None
-        if event_idx is not None and event_idx >= 6:
-            before = sse_rows[event_idx - 6:event_idx]
-            after_rows = sse_rows[event_idx:min(event_idx + 6, len(sse_rows))]
-            before_avg = sum(x["volume_lots"] for x in before) / len(before) if before else 0
-            after_avg = sum(x["volume_lots"] for x in after_rows) / len(after_rows) if after_rows else 0
-            volume_ratio = after_avg / before_avg if before_avg else None
+            moves[symbol], ratio, windows[symbol] = _event_window(
+                rows, published, cn_timestamp(minute_pack.get("as_of")))
+            if symbol == "sh000001":
+                volume_ratio = ratio
         max_move = max((abs(x) for x in moves.values() if x is not None), default=0)
-        if max_move >= 0.5 and (volume_ratio or 0) >= 1.2:
+        if all(move is None for move in moves.values()):
+            strength = "窗口待完成或数据不足"
+        elif max_move >= 0.5 and (volume_ratio or 0) >= 1.2:
             strength = "较强同步"
         elif max_move >= 0.3:
             strength = "一般同步"
@@ -735,6 +756,7 @@ def align_intraday_events(minute_pack: dict, events_pack: dict) -> list[dict]:
             "verification": event.get("verification"),
             "event_scope": _event_scope(event["title"]),
             "moves_30m_pct": moves,
+            "windows": windows,
             "volume_ratio": volume_ratio,
             "max_abs_move_pct": max_move,
             "alignment_strength": strength,
@@ -821,9 +843,12 @@ def build_intraday_section(report_date: str, minute_pack: dict, events_pack: dic
         for x in visible:
             moves = x["moves_30m_pct"]
             title = html.escape(x["title"][:100])
+            window = next(info for info in x["windows"].values() if info["complete"])
+            interval = f'{cn_timestamp(window["actual_start"]):%H:%M}–{cn_timestamp(window["actual_end"]):%H:%M}'
             event_rows.append([
                 datetime.fromisoformat(x["published_at"]).strftime("%H:%M"),
                 title,
+                interval,
                 fmt_pct(moves.get("sh000001")),
                 fmt_pct(moves.get("sh000300")),
                 fmt_pct(moves.get("sz399006")),
@@ -834,10 +859,11 @@ def build_intraday_section(report_date: str, minute_pack: dict, events_pack: dic
         driver = (
             '<h3>带时间戳候选事件与行情同步</h3>'
             '<p class="warning">下表只说明快讯发布时间与随后30分钟行情同步，'
+            '非整5分钟发布时使用向下对齐的5分钟价格代理，实际观察区间见表；'
             '不代表已经证明价格因果；未取得事件真实发生时间或官方文件时，不升级为“已确认驱动”。</p>'
             '<div class="scroll">'
             + html_table(
-                ["发布时间", "候选事件", "上证30分钟", "沪深300 30分钟",
+                ["发布时间", "候选事件", "实际价格区间", "上证30分钟", "沪深300 30分钟",
                  "创业板30分钟", "成交量比", "同步强度"],
                 event_rows,
             )
@@ -845,9 +871,12 @@ def build_intraday_section(report_date: str, minute_pack: dict, events_pack: dic
         )
     else:
         driver = (
-            '<p class="note">已取得盘中快讯时间戳，但未发现达到阈值的30分钟同步价格反应；'
+            '<p class="note">完整有效窗口中，未发现达到阈值的30分钟同步价格反应；'
             '本节不指定单一核心驱动。</p>'
         )
+    pending_count = sum(not any(info["complete"] for info in item["windows"].values()) for item in aligned)
+    if pending_count:
+        driver += f'<p class="note">{pending_count} 条事件窗口待完成或数据不足，未输出正式30分钟反应或同步评级。</p>'
     section = (
         '<section id="intraday"><h2>3. 盘中节奏与核心驱动</h2>'
         '<p class="note">盘中阶段由腾讯5分钟K重建；集合竞价阶段仅使用开盘价相对昨收，'
@@ -1266,6 +1295,7 @@ def render(report_date,now,tq,eq,tech,kl,inds,flow_ind,flow_con,zt,zb,dt,yzt,lhb
     q0=q("sh000001"); q3=q("sh000300"); qg=q("sz399006"); sz=q("sz399001")
     turnover = market_turnover / 1e4 if market_turnover is not None else None
     values={
+      "REPORT_AS_OF_ISO":as_of.isoformat(),
       "REPORT_DATE_SHANGHAI":report_date,"MARKET_PHASE":"A股盘中快报" if is_intraday else "A股收盘复盘","GENERATED_AT_SHANGHAI":now.strftime("%Y-%m-%d %H:%M:%S Asia/Shanghai"),"DATA_AS_OF":as_of.strftime("%Y-%m-%d %H:%M Asia/Shanghai"),"SESSION_SCOPE":"盘中快照，数据未经收盘确认" if is_intraday else "集合竞价、上午盘、下午盘；收盘后公告单独标注",
       "SSE_CLOSE":fmt_num(q0.get("price")),"SSE_CHANGE":fmt_pct(q0.get("change_pct")),"CSI300_CLOSE":fmt_num(q3.get("price")),"CSI300_CHANGE":fmt_pct(q3.get("change_pct")),"CHINEXT_CLOSE":fmt_num(qg.get("price")),"CHINEXT_CHANGE":fmt_pct(qg.get("change_pct")),"TOTAL_TURNOVER":fmt_amount_wan(turnover),"TURNOVER_CHANGE":f'<span class="muted">成交额变化：未取得同口径前值</span>',
       "FIRST_READ_HTML":''.join(f'<div class="decision"><small>{a}</small><strong>{b}</strong></div>' for a,b in [("核心变化",status),("主线",html.escape(focus)),("已反映/待验证","价格先行，公告与资金需验证"),("下一验证点","成交额、宽度与涨停梯队")]),

@@ -33,6 +33,13 @@ def cn_close_quote_errors(quotes: dict, cutoff: datetime) -> list[str]:
     return invalid
 
 
+def cn_minute_rows_complete(rows: list, expected: list[datetime]) -> bool:
+    return (isinstance(rows, list) and bool(expected) and len(rows) == len(expected)
+            and all(isinstance(row, dict) and finite_number(row.get("close")) and row["close"] > 0
+                    for row in rows)
+            and [cn_timestamp(row.get("time")) for row in rows] == expected)
+
+
 def cn_close_minute_checks(symbols: dict, quotes: dict, report_date: str) -> dict:
     day = datetime.fromisoformat(report_date).replace(tzinfo=ZoneInfo("Asia/Shanghai"))
     expected = {day.replace(hour=hour, minute=minute) + timedelta(minutes=5 * i)
@@ -48,7 +55,7 @@ def cn_close_minute_checks(symbols: dict, quotes: dict, report_date: str) -> dic
         price = quote.get("price") if isinstance(quote, dict) else None
         error = (abs(final["close"] / price - 1) * 100
                  if final and finite_number(price) and price > 0 else None)
-        complete = set(valid_rows) == expected and len(rows) == 48
+        complete = cn_minute_rows_complete(rows, sorted(expected))
         checks[symbol] = {"complete": complete,
                          "valid": complete and error is not None and error <= 0.2,
                          "bars": len(rows), "close_error_pct": error}

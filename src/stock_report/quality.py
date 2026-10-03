@@ -4,11 +4,24 @@ import json
 import re
 from pathlib import Path
 from typing import Any
+from html.parser import HTMLParser
 
 from .models import QualityIssue, QualityResult
 from .common import cn_timestamp, cn_close_quote_errors, cn_close_minute_checks, cn_close_price_mismatches
 
 PLACEHOLDER_RE = re.compile(r"\{\{[A-Z0-9_]+\}\}")
+
+
+class _ReportMetadata(HTMLParser):
+    def __init__(self):
+        super().__init__()
+        self.values = {}
+
+    def handle_starttag(self, tag, attrs):
+        attributes = dict(attrs)
+        name = attributes.get("name", "") or ""
+        if tag == "meta" and name.startswith("stock-report-"):
+            self.values.setdefault(name, []).append(attributes.get("content"))
 
 
 def unresolved_placeholders(text: str) -> list[str]:
@@ -52,10 +65,11 @@ def _validate_cn_close(payload, evidence_path, issues, checks):
 
 def validate_report(report_path: Path, evidence_path: Path | None = None, *,
                     market: str | None = None, mode: str | None = None,
-                    report_date: str | None = None) -> QualityResult:
+                    report_date: str | None = None, as_of: str | None = None) -> QualityResult:
     issues: list[QualityIssue] = []
     checks: dict[str, Any] = {}
     expected_cn_close = (market == "cn" and mode == "close") or report_path.name.startswith("A股收盘日报_")
+    expected_cn_intraday = (market == "cn" and mode == "intraday") or report_path.name.startswith("A股盘中快报_")
     if not report_path.exists():
         issues.append(QualityIssue("report_missing", f"报告不存在：{report_path}"))
         return QualityResult(False, issues, checks)
@@ -67,7 +81,7 @@ def validate_report(report_path: Path, evidence_path: Path | None = None, *,
     if "�" in text:
         issues.append(QualityIssue("replacement_character", "HTML 中出现 Unicode 替换字符，可能存在编码错误"))
     if evidence_path is None or not evidence_path.exists():
-        issues.append(QualityIssue("evidence_missing", "未找到 evidence.json", "error" if expected_cn_close else "warning"))
+        issues.append(QualityIssue("evidence_missing", "未找到 evidence.json", "error" if expected_cn_close or expected_cn_intraday else "warning"))
         checks["evidence_exists"] = False
     else:
         checks["evidence_exists"] = True
@@ -85,6 +99,19 @@ def validate_report(report_path: Path, evidence_path: Path | None = None, *,
                 issues.append(QualityIssue("mode_mismatch", "证据模式与请求模式不一致"))
             if expected_cn_close or (payload.get("market") == "cn" and payload.get("report_type") == "close"):
                 _validate_cn_close(payload, evidence_path, issues, checks)
+            if payload.get("market") == "cn" and payload.get("report_type") == "intraday":
+                parser = _ReportMetadata()
+                parser.feed(text)
+                fields = parser.values
+                matches = all(fields.get("stock-report-" + key) == [value] for key, value in
+                              (("market", "cn"), ("mode", "intraday"), ("date", evidence_date)))
+                page_times = fields.get("stock-report-as-of", [])
+                page_time = cn_timestamp(page_times[0]) if len(page_times) == 1 else None
+                evidence_time = cn_timestamp(payload.get("as_of"))
+                if not matches or page_time is None or page_time != evidence_time:
+                    issues.append(QualityIssue("page_identity_mismatch", "盘中页面日期/截止时间与证据不一致，或缺少可校验元数据；旧页面需重新生成"))
+                if as_of is not None and cn_timestamp(as_of) != evidence_time:
+                    issues.append(QualityIssue("manifest_cutoff_mismatch", "运行清单截止时间与证据不一致"))
             checks["evidence_report_date"] = evidence_date
             filename_date = re.search(r"\d{4}-\d{2}-\d{2}", report_path.name)
             if evidence_date and filename_date and evidence_date != filename_date.group(0):

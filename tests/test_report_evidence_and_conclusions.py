@@ -34,13 +34,13 @@ class USMoverEvidenceTests(unittest.TestCase):
             stack.enter_context(patch.object(us, "news_pack", return_value=[]))
             evidence_path = root / "runs" / "us" / DAY / "market_data" / "evidence.json"
             render = us.render
-            def verify_then_render(data, events):
+            def verify_then_render(data, events, **context):
                 saved = json.loads(evidence_path.read_text())
                 self.assertIn("OUTSIDE", saved)
                 self.assertEqual(saved["FAILED"]["error"], "timeout")
                 self.assertEqual(saved, data)
                 with patch.object(us, "chart", side_effect=AssertionError("render must be offline")):
-                    return render(data, events)
+                    return render(data, events, **context)
             stack.enter_context(patch.object(us, "render", side_effect=verify_then_render))
             output = us.main(DAY, template=ROOT / "templates" / "us_close.html",
                              reports_dir=root / "reports", runs_dir=root / "runs")
@@ -50,7 +50,7 @@ class USMoverEvidenceTests(unittest.TestCase):
             saved = json.loads(evidence_path.read_text())
             before = copy.deepcopy(saved)
             with patch.object(us, "chart", side_effect=AssertionError("offline replay")):
-                render(saved, [])
+                render(saved, [], template=ROOT / "templates" / "us_close.html", output=output)
             self.assertEqual(first, output.read_text())
             self.assertEqual(saved, before)
 
@@ -58,7 +58,7 @@ class USMoverEvidenceTests(unittest.TestCase):
         with patch.object(us, "OUT", Path("/tmp/us-render-not-written.html")), \
                 patch.object(us, "chart", side_effect=AssertionError("render must not fetch")), \
                 patch.object(us, "render_template") as output:
-            us.render({"gainers": [{"symbol": "MISSING"}], "after": {}}, [])
+            us.render({"report_date": DAY, "gainers": [{"symbol": "MISSING"}], "after": {}}, [], output=Path("/tmp/us-render-not-written.html"))
         self.assertIn("MISSING", output.call_args.args[1]["MOVERS_TABLE_HTML"])
         self.assertIn("未取得", output.call_args.args[1]["MOVERS_TABLE_HTML"])
 

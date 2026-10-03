@@ -102,7 +102,10 @@ class PipelineTests(unittest.TestCase):
                 evidence = context.market_run_dir("2026-08-03") / "market_data" / "evidence.json"
                 report.parent.mkdir(parents=True)
                 evidence.parent.mkdir(parents=True)
-                report.write_text("<html>intraday</html>", encoding="utf-8")
+                report.write_text('<html><head><meta name="stock-report-date" content="2026-08-03">'
+                                  '<meta name="stock-report-as-of" content="2026-08-03T10:30:00+08:00">'
+                                  '<meta name="stock-report-market" content="cn">'
+                                  '<meta name="stock-report-mode" content="intraday"></head></html>', encoding="utf-8")
                 evidence.write_text(json.dumps({"market": "cn", "report_date": "2026-08-03",
                     "report_type": "intraday", "as_of": "2026-08-03T10:30:00+08:00"}), encoding="utf-8")
                 return "2026-08-03", report
@@ -113,6 +116,7 @@ class PipelineTests(unittest.TestCase):
                 )
             expected = root.resolve() / "runs" / "cn" / "2026-08-03" / "intraday_latest"
             self.assertEqual(result.mode, "intraday")
+            self.assertTrue(result.quality.passed)
             self.assertEqual(result.manifest_path, expected / "manifest.json")
             self.assertEqual(result.evidence_path, expected / "market_data" / "evidence.json")
 

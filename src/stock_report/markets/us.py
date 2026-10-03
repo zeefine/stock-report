@@ -14,7 +14,8 @@ except ModuleNotFoundError:  # defensive fallback for standalone module executio
     _technical_snapshot = None
 from stock_report.news import load_news_events
 from stock_report.render import html_table as _shared_html_table, render_template
-from stock_report.common import next_us_trading_days
+from stock_report.common import next_us_trading_days, finite_number, validate_date
+from stock_report.analysis import classify_market
 
 ROOT = Path(__file__).resolve().parents[3]
 REPORT_DATE = ""
@@ -87,8 +88,11 @@ def rsi(vals,n=14):
     ag=sum(gains)/n; al=sum(losses)/n
     return 100 if al==0 else 100-100/(1+ag/al)
 
-def technical(d):
-    rows=[r for r in d.get("rows",[]) if r["close"] is not None and (not REPORT_DATE or r["date"]<=REPORT_DATE)]
+def technical(d, report_date: str):
+    validate_date(report_date)
+    rows=sorted((r for r in d.get("rows",[]) if isinstance(r, dict)
+                 and finite_number(r.get("close")) and r["close"] > 0
+                 and isinstance(r.get("date"), str) and r["date"] <= report_date), key=lambda r:r["date"])
     if _technical_snapshot is not None:
         z=_technical_snapshot(rows)
         return {"close":z["close"],"day":z["day"],"r5":z["r5"],
@@ -203,7 +207,7 @@ def main(
         data["gainers"]=screener("day_gainers"); data["losers"]=screener("day_losers")
         data["mover_scope"]="yahoo_current_market_screener"
     else:
-        snapshots=[(symbol,technical(data.get(symbol,{}))) for symbol in STOCK_POOL]
+        snapshots=[(symbol,technical(data.get(symbol,{}), REPORT_DATE)) for symbol in STOCK_POOL]
         snapshots=[item for item in snapshots if item[1].get("day") is not None]
         snapshots.sort(key=lambda item:item[1]["day"], reverse=True)
         data["gainers"]=[{"symbol":symbol,"shortName":symbol} for symbol,_ in snapshots[:8]]
@@ -223,24 +227,51 @@ def main(
     data["after"] = after
     data["report_date"] = REPORT_DATE
     data["generated_at"] = datetime.now(timezone.utc).isoformat()
+    data["as_of"] = ASOF
+    data["calendar_dates"] = CALENDAR_DATES
     (DATA_DIR/"evidence.json").write_text(json.dumps(data,ensure_ascii=False,indent=2))
-    return render(data, news_pack())
-
-def q(symbol): return technical(DATA.get(symbol,{}))
+    return render(data, news_pack(), template=TEMPLATE, output=OUT)
 
 def table(headers, rows):
     return _shared_html_table(headers, rows)
 
-def render(data, events):
-    global DATA
-    DATA=data
+def render(data, events, *, template: Path | None = None, output: Path | None = None):
+    """Replay only saved evidence; dates and destinations never come from run globals."""
+    report_date = validate_date(data.get("report_date"))
+    if report_date is None:
+        raise ValueError("美股证据缺少 report_date，无法离线渲染")
+    calendar_dates = data.get("calendar_dates") or _next_weekdays(report_date, 3)
+    generated = data.get("generated_at")
+    try:
+        stamp = datetime.fromisoformat(generated)
+        if stamp.tzinfo is None:
+            raise ValueError("generated_at 缺少时区")
+        generated_at = stamp.astimezone(SH_TZ).strftime("%Y-%m-%d %H:%M:%S Asia/Shanghai")
+    except (TypeError, ValueError):
+        generated_at = "未取得"
+    as_of = data.get("as_of") or f"{report_date} 常规收盘；盘后以已保存证据为准"
+    template_path = Path(template) if template else Path(__file__).resolve().parents[3] / "templates" / "us_close.html"
+    output_path = Path(output) if output else Path(__file__).resolve().parents[3] / "reports" / f"美股收盘日报_{report_date}.html"
+    def q(symbol):
+        snapshot = technical(data.get(symbol) or {}, report_date)
+        # Older observations may support history but are not report-day quotes.
+        return snapshot if snapshot["last_date"] == report_date else technical({}, report_date)
     spy=q("SPY"); qqq=q("QQQ"); vix=q("^VIX")
     t=data.get("treasury",{}); spread=t.get("spread")
     sectors=[("XLK","科技"),("XLC","通信"),("XLY","可选消费"),("XLP","必选消费"),("XLE","能源"),("XLF","金融"),("XLV","医疗"),("XLI","工业"),("XLB","材料"),("XLRE","房地产"),("XLU","公用事业")]
     secrows=[]
     for s,n in sectors:
-        z=q(s); secrows.append((s,n,z.get("close"),z.get("day"),z.get("r5")))
-    secrows.sort(key=lambda x:(x[3] if x[3] is not None else -999), reverse=True)
+        z=q(s)
+        if finite_number(z.get("day")):
+            secrows.append((s,n,z.get("close"),z.get("day"),z.get("r5")))
+    secrows.sort(key=lambda x:(-x[3], x[0]))
+    ranked = len(secrows) >= 6 and secrows[0][3] - secrows[-1][3] > 1e-9
+    strongest = "、".join(x[1] for x in secrows if ranked and abs(x[3] - secrows[0][3]) <= 1e-9)
+    weakest = "、".join(x[1] for x in secrows if ranked and abs(x[3] - secrows[-1][3]) <= 1e-9)
+    sector_note = (f"有效板块ETF {len(secrows)}/11；至少6个才比较强弱。"
+                   + (f"相对领先：{strongest}；相对落后：{weakest}。仅比较有效样本。" if ranked
+                      else "数据不足，不生成排名和主线判断。" if len(secrows) < 6
+                      else "收益无明显差异，不按配置顺序选择强弱。"))
     sector_html=table(["ETF","板块","收盘","日变动","5日变动"],[[f"<strong>{s}</strong>",n,fmt(c),sign_html(d),sign_html(r)] for s,n,c,d,r in secrows])
     ov=[("SPY","标普500",q("SPY")),("QQQ","纳指100",q("QQQ")),("DIA","道指",q("DIA")),("IWM","罗素2000",q("IWM")),("RSP","等权标普",q("RSP"))]
     market_html=table(["代码","指数/代理","收盘","日变动","5日变动","MA20","MA200"],[[s,n,fmt(z["close"]),sign_html(z["day"]),sign_html(z["r5"]),fmt(z["sma20"]),fmt(z["sma200"])] for s,n,z in ov])
@@ -251,7 +282,7 @@ def render(data, events):
     movers=[]
     for label,key in [("涨幅", "gainers"),("跌幅","losers")]:
         for x in data.get(key,[])[:8]:
-            s=x.get("symbol") or ""; z=technical(data.get(s) or {})
+            s=x.get("symbol") or ""; z=q(s)
             movers.append((label,s,x.get("shortName") or x.get("longName") or "",z.get("close"),z.get("day"),z.get("vol_ratio"),data.get("after",{}).get(s)))
     movers_html=table(["方向","代码","名称","收盘","日变动","量比","盘后"],[[lab,s,html.escape(n)[:48],fmt(c),sign_html(ch),fmt(v,2,"x"),fmt(ah)] for lab,s,n,c,ch,v,ah in movers])
     # fixed pool technical table
@@ -261,12 +292,12 @@ def render(data, events):
         z=q(s); techrows.append([f"<strong>{s}</strong>",fmt(z["close"]),sign_html(z["day"]),fmt(z["sma20"]),fmt(z["sma50"]),fmt(z["sma200"]),fmt(z["rsi"],1),fmt(z["vol_ratio"],2,"x")])
     tech_html=table(["代码","收盘","日变动","MA20","MA50","MA200","RSI14","量比"],techrows)
     # earnings
-    rec=data.get("earnings_"+REPORT_DATE,[])
+    rec=data.get("earnings_"+report_date,[])
     rec_major=[r for r in rec if r.get("symbol") in {"MSFT","META","GOOGL","TSLA","V","CMCSA","F","QCOM"}]
     if not rec_major: rec_major=rec[:8]
     rec_html=table(["代码","公司","时段","EPS预期"],[[r.get("symbol"),html.escape(r.get("name") or ""),r.get("time") or "未取得",r.get("eps") or "未取得"] for r in rec_major]) if rec_major else '<p class="muted">未取得。</p>'
     cal=[]
-    for d in CALENDAR_DATES:
+    for d in calendar_dates:
         for r in data.get("earnings_"+d,[])[:12]: cal.append([d,r.get("symbol"),html.escape(r.get("name") or ""),r.get("time") or "未取得",r.get("eps") or "未取得"])
     cal_html=table(["日期","代码","公司","时段","EPS预期"],cal) if cal else '<p class="muted">未取得。</p>'
     # news
@@ -280,33 +311,37 @@ def render(data, events):
     # scenarios/candidates
     candidates=[s for s in ["NVDA","MSFT","META","AAPL","AMZN","TSLA","AMD","AVGO","PLTR","CRWD"] if q(s)["close"] is not None]
     scenario_html=table(["情景","触发条件","观察资产","失效条件"],[["风险偏好延续","SPY守住MA20且QQQ相对强势","QQQ、XLK、SMH","QQQ跌破MA20"],["轮动扩散","RSP相对SPY转强、IWM不再落后","RSP、IWM、XLI","小盘重新走弱"],["利率冲击","10Y−2Y上行且TLT下跌","TLT、HYG/LQD","收益率回落"],["事件驱动","财报/监管 headline 改变预期","财报股、行业ETF","消息被市场快速否定"]])
-    first=[("市场方向", "标普与纳指收盘及5日趋势"), ("主线", secrows[0][1] if secrows else "未取得"), ("风险", "利率、波动率与信用代理"), ("明日", "财报与盘前新闻验证")]
+    status = classify_market({s:q(s)["day"] for s in ("SPY","QQQ","DIA","IWM","RSP")})
+    first=[("市场方向", status), ("相对领先", strongest or "暂不判断"), ("风险", "利率、波动率与信用代理"), ("明日", "财报与盘前新闻验证")]
     first_html="".join(f'<div class="decision"><small>{a}</small><strong>{b}</strong></div>' for a,b in first)
-    status="偏风险偏好" if (spy.get("day") or 0)>0 and (qqq.get("day") or 0)>0 else "分化/防御"
+    def relative(a, b):
+        left, right = q(a)["r5"], q(b)["r5"]
+        return sign_html(left - right if finite_number(left) and finite_number(right) else None)
+    ma20_position = ("上方" if spy["close"] > spy["sma20"] else "下方或持平") if finite_number(spy["close"]) and finite_number(spy["sma20"]) else "未取得，暂不判断"
     values={
-      "REPORT_DATE_ET":REPORT_DATE+" ET","MARKET_PHASE":"常规收盘复盘 + 盘后补充","GENERATED_AT_SHANGHAI":GENERATED_AT,"DATA_AS_OF":ASOF,"SESSION_SCOPE":"Regular close 与 after-hours 分开",
+      "REPORT_DATE_ET":report_date+" ET","MARKET_PHASE":"常规收盘复盘 + 盘后补充","GENERATED_AT_SHANGHAI":generated_at,"DATA_AS_OF":as_of,"SESSION_SCOPE":"Regular close 与 after-hours 分开",
       "SPY_CLOSE":fmt(spy["close"]),"SPY_CHANGE":sign_html(spy["day"]),"QQQ_CLOSE":fmt(qqq["close"]),"QQQ_CHANGE":sign_html(qqq["day"]),"US10Y_VALUE":fmt(t.get("y10"),3,"%"),"US10Y_CLASS":"up" if (t.get("y10") or 0)>0 else "muted","US10Y_CHANGE":"10Y−2Y "+fmt(spread,3,"个百分点"),"VIX_VALUE":fmt(vix["close"]),"VIX_CHANGE":sign_html(vix["day"]),
-      "FIRST_READ_HTML":first_html,"EXECUTIVE_SUMMARY_HTML":f'<p class="lead">{REPORT_DATE} 常规交易日，主要指数表现为：SPY {sign_html(spy["day"])}、QQQ {sign_html(qqq["day"])}；板块日线最强为 {secrows[0][1] if secrows else "未取得"}，新闻包共 {len(events)} 个候选事件（主题分布：{html.escape(topic_str)}）。</p>',"MARKET_STATUS":status,
+      "FIRST_READ_HTML":first_html,"EXECUTIVE_SUMMARY_HTML":f'<p class="lead">{report_date} 常规交易日，主要指数表现为：SPY {sign_html(spy["day"])}、QQQ {sign_html(qqq["day"])}；{sector_note}，新闻包共 {len(events)} 个候选事件（主题分布：{html.escape(topic_str)}）。</p>',"MARKET_STATUS":status,
       "MARKET_OVERVIEW_TABLE_HTML":market_html,"RISK_APPETITE_HTML":f'<p class="note">RSP/SPY 与 HYG/LQD 用作风险偏好代理；10Y−2Y={fmt(spread,3,"个百分点")}，正值代表曲线正斜率。[S1][S2]</p>',
       "INTRADAY_TIMELINE_HTML":'<p class="muted">本版不对5分钟线重建逐时因果；以收盘、盘后和新闻时间戳做事件对照。</p>',"DRIVER_TRANSMISSION_HTML":f'<p>新闻候选事件集中在：{html.escape(topic_str)}。将其视为待验证信息，不直接推断价格因果。[S4]</p>',
       "TREASURY_TABLE_HTML":treasury_html,"CROSS_ASSET_TABLE_HTML":cross_html,"MACRO_EVENTS_HTML":macro_html,
-      "SECTOR_ROTATION_TABLE_HTML":sector_html,"THEME_ROTATION_HTML":f'<p>板块主题按ETF日/5日收益排序；当前首要观察：{secrows[0][1] if secrows else "未取得"}，相对弱势：{secrows[-1][1] if secrows else "未取得"}。[S1]</p>',"SECTOR_TRANSMISSION_HTML":'<p class="note">板块资金流入/流出未使用未经验证的资金流字段；以ETF价格与成交量代理表述。</p>',
-      "BREADTH_PROXY_TABLE_HTML":table(["代理","结果"],[["上涨板块ETF",f"{sum(1 for x in secrows if (x[3] or 0)>0)}/{len(secrows)}"],["QQQ相对SPY",sign_html((qqq["r5"] or 0)-(spy["r5"] or 0))+"（5日变化差）"],["RSP相对SPY",sign_html((q("RSP")["r5"] or 0)-(spy["r5"] or 0))],["HYG相对LQD",sign_html((q("HYG")["r5"] or 0)-(q("LQD")["r5"] or 0))]]),
-      "TECHNICAL_TABLE_HTML":tech_html,"TECHNICAL_COMMENTARY_HTML":f'<p>核心ETF已获取2年日K，MA200可计算；固定观察池使用相同口径。SPY收盘位于MA20 {"上方" if spy["close"] and spy["sma20"] and spy["close"]>spy["sma20"] else "下方"}。[S1]</p>',
+      "SECTOR_ROTATION_TABLE_HTML":sector_html,"THEME_ROTATION_HTML":f'<p>{sector_note}[S1]</p>',"SECTOR_TRANSMISSION_HTML":'<p class="note">板块资金流入/流出未使用未经验证的资金流字段；以ETF价格与成交量代理表述。</p>',
+      "BREADTH_PROXY_TABLE_HTML":table(["代理","结果"],[["上涨板块ETF",f"{sum(x[3]>0 for x in secrows)}/{len(secrows)}（有效样本）" if secrows else "未取得"],["QQQ相对SPY",relative("QQQ","SPY")+"（5日变化差）"],["RSP相对SPY",relative("RSP","SPY")],["HYG相对LQD",relative("HYG","LQD")]]),
+      "TECHNICAL_TABLE_HTML":tech_html,"TECHNICAL_COMMENTARY_HTML":f'<p>技术指标仅使用证据报告日及以前的有效日K；历史不足则显示“未取得”。SPY相对MA20：{ma20_position}。[S1]</p>',
       "IDEA_FUNNEL_HTML":('<p class="note">异动采用固定观察池＋Yahoo Day Gainers/Losers 双通道；量比为报告日成交量÷前20交易日平均成交量，盘后字段与常规收盘分开。[S1]</p>' if data.get("mover_scope")=="yahoo_current_market_screener" else '<p class="note">历史回放不使用当前涨跌榜；异动按固定观察池在报告日的涨跌幅排序。量比为报告日成交量÷前20交易日平均成交量，盘后字段与常规收盘分开。[S1]</p>'),"MOVERS_TABLE_HTML":movers_html,
       "EARNINGS_RECAP_TABLE_HTML":rec_html,"EARNINGS_CALENDAR_TABLE_HTML":cal_html,"EARNINGS_ANALYSIS_HTML":'<p>财报日历仅记录公开日历与EPS预期；未取得正式财报全文时不补写业绩结论。[S3]</p>',
       "POSITIONING_SIGNALS_HTML":'<p class="muted">本版未取得逐股票完整CBOE希腊字母或FINRA空头横截面，故不填充具体期权/做空数值。</p>',"EVENT_ANALYSIS_HTML":'<p>候选公司事件见新闻事件包，需二次核验原始公告后再纳入交易判断。[S4]</p>',
       "UZI_CANDIDATES_HTML":'<p><strong>重点观察：</strong> '+"、".join(candidates)+"。</p>","CHINA_HK_LINKAGE_HTML":'<p class="muted">本报告未发现需要调用 A 股/港股数据层的明确联动证据，保留新闻层观察，不扩展跨市场行情。</p>',
       "SCENARIO_TABLE_HTML":scenario_html,"NEXT_SESSION_WATCHLIST_HTML":'<ul><li>盘前核验财报与重大新闻时间戳。</li><li>观察QQQ/SMH相对SPY是否延续。</li><li>观察10Y−2Y与TLT/HYG-LQD是否确认风险偏好。</li></ul>',
       "FINAL_CONCLUSION_HTML":f'<p class="lead">结论：市场状态为<strong>{status}</strong>。指数方向、利率曲线和板块相对强弱需要联合观察；新闻事件仅作为候选催化剂，不能替代价格与公告证据。[S1][S2][S4]</p>',
-      "SECTOR_SUMMARY_HTML":table(["排序","板块","日变动","5日变动","关注"],[[i+1,n,sign_html(d),sign_html(r),"重点观察" if i<3 else "跟踪"] for i,(s,n,c,d,r) in enumerate(secrows)]),
-      "MARKET_STAGE":"趋势与轮动并存，等待财报/宏观验证","POSITIONING_BIAS_HTML":'<p>以观察和分层验证为主；不替代个人持仓与风险预算。</p>',"VALIDATION_SIGNALS_HTML":'<ol><li>SPY/QQQ是否守住MA20。</li><li>RSP与IWM相对强弱是否改善。</li><li>10Y−2Y是否继续上行。</li><li>HYG/LQD是否确认信用风险偏好。</li><li>重大财报与新闻是否出现可核验原始文件。</li></ol>',
+      "SECTOR_SUMMARY_HTML":table(["排序","板块","日变动","5日变动"],[[1+sum(y[3]>d+1e-9 for y in secrows) if ranked else "不排名",n,sign_html(d),sign_html(r)] for s,n,c,d,r in secrows])+f'<p>{sector_note}</p>',
+      "MARKET_STAGE":status,"POSITIONING_BIAS_HTML":'<p>以观察和分层验证为主；不替代个人持仓与风险预算。</p>',"VALIDATION_SIGNALS_HTML":'<ol><li>SPY/QQQ是否守住MA20。</li><li>RSP与IWM相对强弱是否改善。</li><li>10Y−2Y是否继续上行。</li><li>HYG/LQD是否确认信用风险偏好。</li><li>重大财报与新闻是否出现可核验原始文件。</li></ol>',
       "EVIDENCE_LIMITATIONS_HTML":'<ul><li>新闻源为公开RSS聚合，部分源抓取失败或仅有标题。</li><li>盘后价格只在 Yahoo chart 能确认时间戳时填充，其余显示“未取得”。</li><li>市场宽度为代理，不等同全市场涨跌家数。</li></ul>',
-      "SOURCES_HTML":f'<ol><li>[S1] Yahoo Finance Chart API：行情、日K、技术指标、ETF与异动代理；<code>query2.finance.yahoo.com/v8/finance/chart</code>，as_of {REPORT_DATE} 20:00 ET。</li><li>[S2] U.S. Treasury Daily Treasury Par Yield Curve：截至 {REPORT_DATE} 的最近可得观测；<code>home.treasury.gov/.../daily-treasury-rates.csv</code>。</li><li>[S3] Nasdaq Earnings Calendar API：{REPORT_DATE} 至 {CALENDAR_DATES[-1] if CALENDAR_DATES else REPORT_DATE}；<code>api.nasdaq.com/api/calendar/earnings</code>。</li><li>[S4] scan-market-news 本地证据包：<code>runs/us/{REPORT_DATE}/news/</code>；窗口与来源成功率以该目录 manifest.json 为准。</li></ol>'
+      "SOURCES_HTML":f'<ol><li>[S1] Yahoo Finance Chart API：行情、日K、技术指标、ETF与异动代理；<code>query2.finance.yahoo.com/v8/finance/chart</code>，as_of {report_date} 20:00 ET。</li><li>[S2] U.S. Treasury Daily Treasury Par Yield Curve：截至 {report_date} 的最近可得观测；<code>home.treasury.gov/.../daily-treasury-rates.csv</code>。</li><li>[S3] Nasdaq Earnings Calendar API：{report_date} 至 {calendar_dates[-1] if calendar_dates else report_date}；<code>api.nasdaq.com/api/calendar/earnings</code>。</li><li>[S4] scan-market-news 本地证据包：<code>runs/us/{report_date}/news/</code>；窗口与来源成功率以该目录 manifest.json 为准。</li></ol>'
     }
-    render_template(TEMPLATE, values, OUT, strict=True)
-    print(f"Wrote {OUT}")
-    return OUT
+    render_template(template_path, values, output_path, strict=True)
+    print(f"Wrote {output_path}")
+    return output_path
 
 def run(context):
     report_path = Path(main(
