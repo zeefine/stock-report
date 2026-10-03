@@ -13,7 +13,10 @@
   "markets": {
     "cn": {
       "timezone": "Asia/Shanghai",
-      "template": "cn_close.html",
+      "close_template": "cn_close.html",
+      "intraday_template": "cn_intraday.html",
+      "close_ready_after": "15:15",
+      "intraday_cache_seconds": 120,
       "prompt": "cn.md"
     },
     "us": {

@@ -3,7 +3,7 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![Python](https://img.shields.io/badge/Python-3.12%2B-3776AB.svg)](pyproject.toml)
 
-一个面向 A 股和美股的确定性收盘日报流水线：使用代码完成公开数据采集、指标计算、质量校验、证据留存和 HTML 渲染，而不是让一段大型 Prompt 控制全部流程。
+一个面向 A 股和美股的确定性市场报告流水线：使用代码完成公开数据采集、指标计算、质量校验、证据留存和 HTML 渲染，而不是让一段大型 Prompt 控制全部流程。A 股同时支持盘中快报和正式收盘日报。
 
 当前状态：
 
@@ -20,6 +20,7 @@
 - 美股常规收盘与 ET 16:00–20:00 盘后数据分离；
 - 历史美股回放自动避免使用当前涨跌榜，防止未来数据穿越；
 - A 股 5 分钟行情、盘中阶段重建和时间戳事件对齐；
+- A 股 `intraday` / `close` 双模式、独立缓存和质量门；
 - 证据文件、来源信息、质量结果和运行 manifest 分层保存；
 - HTML 未渲染占位符、报告/证据日期、历史长度等自动检查；
 - Prompt 只约束表达，不参与行情计算和质量判断；
@@ -58,14 +59,15 @@ git clone <your-repository-url>
 cd stock
 uv sync
 
-uv run stock-report run --market cn
+uv run stock-report run --market cn --mode intraday
+uv run stock-report run --market cn --mode close
 uv run stock-report run --market us
 ```
 
 ### 不安装项目，直接从源码运行
 
 ```bash
-PYTHONPATH=src python -m stock_report.cli run --market cn
+PYTHONPATH=src python -m stock_report.cli run --market cn --mode intraday
 PYTHONPATH=src python -m stock_report.cli run --market us
 ```
 
@@ -78,12 +80,34 @@ python scripts/generate_us_close_report.py
 
 ## CLI 使用
 
-生成最近完整交易日的日报：
+生成 A 股盘中快报或收盘日报：
 
 ```bash
-stock-report run --market cn
+stock-report run --market cn --mode intraday
+stock-report run --market cn --mode intraday --refresh
+stock-report run --market cn --mode close
 stock-report run --market us
 ```
+
+`--mode auto` 会在 A 股交易时段选择盘中模式，15:15 后选择收盘模式。盘中还可使用 `--as-of HH:MM` 指定截止时间。
+
+A 股指定 `--as-of` 时，报价必须有同日报告时段内且不晚于截止时间的时间戳。
+历史盘中回放必须同时指定 `--date` 和 `--as-of`；历史收盘报告默认截止到报告日 23:59:59。
+不指定截止时间的当日实时运行，会在取数结束时确定实际截止时间，并将行情快照保存到
+`runs/cn/<report_date>/snapshots/`，供后续回放使用。
+板块资金流、涨跌停池等无法按时间回溯的数据，仅使用截止前已保存的同日快照；没有快照时显示“未取得”。
+可用历史日K（不复权）或已完成的5分钟K重建价格，成交额、换手率和盘中量比不做推算。
+缺少报告日K线时不会用其他交易日的行情代替；各字段的时间与来源保存在 `evidence.json`。
+
+正式 A 股收盘报告要求上证指数、深证成指、沪深300、创业板指的有效收盘价、涨跌幅和同日时间戳，
+并核验6个分钟线指数中至少5个具有完整的48根5分钟K线，且末根价格与收盘价偏差不超过0.2%。
+核心检查失败时 `quality.passed=false`，CLI 返回退出码2；新闻事件不足只降级对应章节。
+校验会读取实际 `minute_indices.json`，不会仅相信证据中声明的覆盖率或成功标志。
+
+A 股跨市场参考从配置的 `runs_dir/us/` 中选择截至报告时间已经收盘的美股日线，
+按美东交易日历处理周末、常规休市日和提前收盘日（[NYSE日历](https://www.nyse.com/trade/hours-calendars)）。
+表格显示各资产实际数据日期；缺少最近交易日数据时，旧数据明确标记为“过期参考”，
+不会冒充前一交易日数据。所用证据路径和日期同时保存到 `evidence.json` 的 `cross_market` 字段。
 
 指定报告日：
 
@@ -95,6 +119,7 @@ stock-report run --market us --date 2026-07-31
 
 ```bash
 stock-report validate --market cn --date 2026-07-31
+stock-report validate --market cn --date 2026-08-03 --mode intraday
 stock-report validate --market us --date 2026-07-31
 ```
 
@@ -161,12 +186,16 @@ stock/
 每次运行按照市场和报告日保存证据：
 
 ```text
-runs/<market>/<report_date>/
-├── manifest.json
-├── market_data/
-│   └── evidence.json
-└── news/
+runs/cn/<report_date>/
+├── intraday_latest/
+│   ├── manifest.json
+│   └── market_data/
+└── close/
+    ├── manifest.json
+    └── market_data/
 ```
+
+美股继续使用 `runs/us/<report_date>/`。新闻输入保持在 `runs/<market>/<report_date>/news/`，供两种模式共用。
 
 A 股盘中流程还会生成：
 
@@ -178,6 +207,8 @@ A 股盘中流程还会生成：
 
 ```text
 reports/A股收盘日报_<date>_Asia-Shanghai.html
+reports/A股盘中快报_<date>_<HHMM>.html
+reports/A股盘中快报_latest.html
 reports/美股收盘日报_<date>.html
 ```
 

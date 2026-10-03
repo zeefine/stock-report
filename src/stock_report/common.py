@@ -1,13 +1,62 @@
 from __future__ import annotations
 
 import json
+import math
 import re
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, time, timedelta
 from pathlib import Path
 from typing import Any, Iterable
 from zoneinfo import ZoneInfo
 
 DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+CN_CORE_QUOTES = ("sh000001", "sz399001", "sh000300", "sz399006")
+CN_MINUTE_INDEXES = ("sh000001", "sh000300", "sh000905", "sz399852", "sz399006", "sh000688")
+
+
+def finite_number(value: Any) -> bool:
+    return isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value)
+
+
+def cn_close_quote_errors(quotes: dict, cutoff: datetime) -> list[str]:
+    invalid = []
+    for symbol in CN_CORE_QUOTES:
+        quote = quotes.get(symbol) or {}
+        if not isinstance(quote, dict):
+            invalid.append(symbol)
+            continue
+        observed = cn_timestamp(quote.get("time"))
+        if (not finite_number(quote.get("price")) or quote["price"] <= 0
+                or not finite_number(quote.get("change_pct"))
+                or observed is None or observed.date() != cutoff.date()
+                or observed.hour < 15 or observed > cutoff):
+            invalid.append(symbol)
+    return invalid
+
+
+def cn_close_minute_checks(symbols: dict, quotes: dict, report_date: str) -> dict:
+    day = datetime.fromisoformat(report_date).replace(tzinfo=ZoneInfo("Asia/Shanghai"))
+    expected = {day.replace(hour=hour, minute=minute) + timedelta(minutes=5 * i)
+                for hour, minute in ((9, 35), (13, 5)) for i in range(24)}
+    checks = {}
+    for symbol in CN_MINUTE_INDEXES:
+        rows = symbols.get(symbol) or []
+        rows = rows if isinstance(rows, list) else []
+        valid_rows = {cn_timestamp(r.get("time")): r for r in rows if isinstance(r, dict)
+                      and finite_number(r.get("close")) and r["close"] > 0}
+        final = valid_rows.get(day.replace(hour=15)) or {}
+        quote = quotes.get(symbol) or {}
+        price = quote.get("price") if isinstance(quote, dict) else None
+        error = (abs(final["close"] / price - 1) * 100
+                 if final and finite_number(price) and price > 0 else None)
+        checks[symbol] = {"valid": set(valid_rows) == expected and len(rows) == 48
+                         and error is not None and error <= 0.2,
+                         "bars": len(rows), "close_error_pct": error}
+    return checks
+
+
+def cn_close_price_mismatches(checks: dict) -> list[str]:
+    return [symbol for symbol in CN_CORE_QUOTES
+            if (checks.get(symbol, {}).get("close_error_pct") or 0) > 0.2]
 
 
 def project_root() -> Path:
@@ -39,6 +88,79 @@ def validate_date(value: str | None) -> str | None:
 
 def now_in(timezone_name: str) -> datetime:
     return datetime.now(ZoneInfo(timezone_name))
+
+
+def cn_timestamp(value: Any) -> datetime | None:
+    """Parse a provider timestamp; compact Tencent times are Shanghai local time."""
+    if not isinstance(value, str) or not value:
+        return None
+    try:
+        parsed = (datetime.strptime(value, "%Y%m%d%H%M%S")
+                  if re.fullmatch(r"\d{14}", value) else datetime.fromisoformat(value))
+        if parsed.tzinfo is None:
+            # Only the provider's documented compact format implies a timezone.
+            if not re.fullmatch(r"\d{14}", value):
+                return None
+            parsed = parsed.replace(tzinfo=ZoneInfo("Asia/Shanghai"))
+        return parsed.astimezone(ZoneInfo("Asia/Shanghai"))
+    except ValueError:
+        return None
+
+
+def cn_session_state(moment: datetime) -> str:
+    """Classify the regular A-share session using Asia/Shanghai local time."""
+    local = moment.astimezone(ZoneInfo("Asia/Shanghai"))
+    if local.weekday() >= 5:
+        return "closed"
+    current = local.time().replace(tzinfo=None)
+    if current < time(9, 15):
+        return "pre_market"
+    if current < time(9, 30):
+        return "auction"
+    if current <= time(11, 30):
+        return "morning"
+    if current < time(13, 0):
+        return "lunch_break"
+    if current <= time(15, 0):
+        return "afternoon"
+    if current < time(15, 15):
+        return "closing_pending"
+    return "closed"
+
+
+def resolve_report_mode(
+    market: str,
+    requested: str,
+    report_date: str | None,
+    moment: datetime,
+) -> str:
+    if requested not in {"auto", "intraday", "close"}:
+        raise ValueError("mode 必须是 auto、intraday 或 close")
+    if market != "cn":
+        if requested == "intraday":
+            raise ValueError("当前仅 A 股支持 intraday 模式")
+        return "close"
+    if requested != "auto":
+        return requested
+    local = moment.astimezone(ZoneInfo("Asia/Shanghai"))
+    if report_date and report_date != local.date().isoformat():
+        return "close"
+    return "intraday" if cn_session_state(local) in {
+        "auction", "morning", "lunch_break", "afternoon", "closing_pending"
+    } else "close"
+
+
+def parse_as_of(value: str | None, timezone_name: str, report_date: str | None,
+                moment: datetime) -> datetime:
+    local = moment.astimezone(ZoneInfo(timezone_name))
+    if value is None:
+        return local
+    try:
+        parsed = datetime.strptime(value, "%H:%M").time()
+    except ValueError as exc:
+        raise ValueError("as-of 必须使用 HH:MM 格式") from exc
+    target_date = date.fromisoformat(report_date) if report_date else local.date()
+    return datetime.combine(target_date, parsed, ZoneInfo(timezone_name))
 
 
 def next_weekdays(start: str, count: int, include_start: bool = False) -> list[str]:
@@ -88,7 +210,6 @@ def _easter_sunday(year: int) -> date:
 
 def us_exchange_holidays(year: int) -> set[date]:
     holidays = {
-        _observed(date(year, 1, 1)),
         _nth_weekday(year, 1, 0, 3),       # MLK Day
         _nth_weekday(year, 2, 0, 3),       # Presidents Day
         _easter_sunday(year) - timedelta(days=2),
@@ -99,10 +220,10 @@ def us_exchange_holidays(year: int) -> set[date]:
         _nth_weekday(year, 11, 3, 4),      # Thanksgiving
         _observed(date(year, 12, 25)),
     }
-    # A Saturday New Year's Day is observed on Dec 31 of the prior year.
-    next_new_year = _observed(date(year + 1, 1, 1))
-    if next_new_year.year == year:
-        holidays.add(next_new_year)
+    # NYSE does not observe Saturday New Year's Day on the preceding Friday.
+    new_year = date(year, 1, 1)
+    if new_year.weekday() != 5:
+        holidays.add(_observed(new_year))
     return holidays
 
 
@@ -114,6 +235,24 @@ def next_us_trading_days(start: str, count: int) -> list[str]:
             out.append(current.isoformat())
         current += timedelta(days=1)
     return out
+
+
+def us_session_close(day: date) -> datetime | None:
+    if day.weekday() >= 5 or day in us_exchange_holidays(day.year):
+        return None
+    # NYSE holiday/early-closing calendar: https://www.nyse.com/trade/hours-calendars
+    early = (day == _nth_weekday(day.year, 11, 3, 4) + timedelta(days=1)
+             or (day.month, day.day) in {(7, 3), (12, 24)})
+    return datetime.combine(day, time(13 if early else 16), ZoneInfo("America/New_York"))
+
+
+def latest_completed_us_session(cutoff: datetime) -> str:
+    day = cutoff.astimezone(ZoneInfo("America/New_York")).date()
+    while True:
+        close = us_session_close(day)
+        if close is not None and close <= cutoff:
+            return day.isoformat()
+        day -= timedelta(days=1)
 
 
 def first_existing(paths: Iterable[Path]) -> Path | None:

@@ -314,6 +314,17 @@ def _fetch_basic_a(ti: TickerInfo) -> dict:
     out = {"code": ti.full}
     xq_symbol = ("SH" if ti.full.endswith("SH") else "SZ") + ti.code
 
+    # Quick scans should never spend minutes retrying a blocked XueQiu TLS
+    # connection before reaching the stable Tencent quote endpoint.  This mode
+    # is deliberately opt-in so full research keeps its richer source chain.
+    if os.environ.get("UZI_FAST_FAIL") == "1":
+        qt = _fetch_price_tencent_qt("A", ti.code)
+        if qt.get("price"):
+            out.update(qt)
+            out["industry"] = _known_stock_industry(ti.code)
+            _append_fallback_snap(out, "tencent_qt_fast")
+            return out
+
     # TIER 0 (optional): MX 妙想 Skills Hub — official NLP API. Used when MX_APIKEY is set.
     # Much more stable than scraping push2.eastmoney.com in Mainland networks.
     if _mx_available():

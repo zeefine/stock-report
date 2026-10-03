@@ -30,7 +30,18 @@ class _BaostockProvider:
     def _ensure_login(self) -> None:
         if self._logged_in or not _BS_OK:
             return
-        lg = bs.login()
+        # BaoStock uses a raw socket without configuring a timeout.  In
+        # restricted or overseas networks its login ``recv`` can otherwise
+        # block the whole analysis pipeline indefinitely.  Apply a short
+        # default only while the login socket is created; the socket retains
+        # the timeout afterwards and callers can fall back to other sources.
+        import socket
+        previous_timeout = socket.getdefaulttimeout()
+        socket.setdefaulttimeout(8)
+        try:
+            lg = bs.login()
+        finally:
+            socket.setdefaulttimeout(previous_timeout)
         if lg.error_code != "0":
             raise ProviderError(f"baostock login: {lg.error_code} {lg.error_msg}")
         self._logged_in = True

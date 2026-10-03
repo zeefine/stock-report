@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib, html, json, re, time, urllib.parse, urllib.request
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
 from zoneinfo import ZoneInfo
@@ -13,6 +14,10 @@ except ModuleNotFoundError:  # defensive fallback for standalone module executio
     _technical_snapshot = None
 from stock_report.news import load_news_events
 from stock_report.render import html_table as _shared_html_table, render_template
+from stock_report.common import (
+    cn_session_state, cn_timestamp, cn_close_quote_errors, cn_close_minute_checks, cn_close_price_mismatches,
+    CN_MINUTE_INDEXES, finite_number, latest_completed_us_session, us_session_close,
+)
 
 ROOT = Path(__file__).resolve().parents[3]
 UA = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36"
@@ -26,10 +31,7 @@ INDEXES = [
     ("sh000905", "中证500"), ("sz399852", "中证1000"), ("sz399006", "创业板指"),
     ("sh000688", "科创50"), ("sh000016", "上证50"),
 ]
-INTRADAY_INDEXES = [
-    "sh000001", "sh000300", "sh000905",
-    "sz399852", "sz399006", "sh000688",
-]
+INTRADAY_INDEXES = list(CN_MINUTE_INDEXES)
 POOL = [
     "600519","300750","601318","600036","000333","002594","601138","300308",
     "002475","688041","688256","002371","000858","603288","600276","300760",
@@ -80,6 +82,12 @@ def code_prefix(code: str) -> str:
     if c.startswith(("5", "6", "9")): return "sh"
     return "sz"
 
+
+def market_symbol(code: str) -> str:
+    """Keep explicit index markets; infer the market only for bare stock codes."""
+    code = code.lower()
+    return code if code.startswith(("sh", "sz", "bj")) else code_prefix(code) + code
+
 def fmt_num(x, digits=2):
     if x is None: return "未取得"
     return f"{x:,.{digits}f}"
@@ -91,6 +99,11 @@ def fmt_pct(x, digits=2):
 
 def fmt_money_yi(x):
     return "未取得" if x is None else f"{x/1e8:,.2f}亿"
+
+
+def fmt_amount_wan(amount_wan):
+    """Format Tencent's 万元 amount without converting a missing value to zero."""
+    return fmt_money_yi(amount_wan * 1e4) if amount_wan is not None else "未取得"
 
 def pct(a, b):
     return (a / b - 1) * 100 if a is not None and b not in (None, 0) else None
@@ -126,32 +139,40 @@ def tencent_quotes(codes: list[str]) -> dict[str, dict]:
     return out
 
 def em_quotes(codes: list[str]) -> dict[str, dict]:
-    secids = []
+    symbols_by_secid = {}
     for raw in codes:
-        c = raw.lower().replace("sh", "").replace("sz", "").replace("bj", "")
-        # Explicit index prefixes are important for 000xxx ambiguity.
-        p = raw[:2].lower() if raw[:2].lower() in ("sh", "sz", "bj") else code_prefix(c)
-        secids.append(("1" if p == "sh" else "0") + "." + c)
-    params = {"fltt": "2", "invt": "2", "fields": "f2,f3,f4,f12,f14,f104,f105",
-             "secids": ",".join(secids)}
+        symbol = market_symbol(raw)
+        secid = ("1" if symbol.startswith("sh") else "0") + "." + symbol[2:]
+        symbols_by_secid[secid] = symbol
+    params = {"fltt": "2", "invt": "2", "fields": "f2,f3,f4,f12,f13,f14,f104,f105",
+             "secids": ",".join(symbols_by_secid)}
     d = get_json("https://push2.eastmoney.com/api/qt/ulist.np/get", params=params,
                  headers={"Referer": "https://quote.eastmoney.com/"}, timeout=15)
     diff = ((d.get("data") or {}).get("diff") or [])
     if isinstance(diff, dict): diff = list(diff.values())
     out = {}
     for x in diff:
-        c = x.get("f12", "")
-        out[c] = {"name": x.get("f14", ""), "price": x.get("f2"), "change_pct": x.get("f3"),
+        symbol = symbols_by_secid.get(f"{x.get('f13')}.{x.get('f12')}")
+        if symbol is None:
+            # Never guess from a six-digit code or the order of returned rows.
+            continue
+        out[symbol] = {"name": x.get("f14", ""), "price": x.get("f2"), "change_pct": x.get("f3"),
                   "change_amt": x.get("f4"), "up_count": x.get("f104"), "down_count": x.get("f105")}
     return out
 
-def kline(symbol: str, n: int = 320) -> list[dict]:
+def kline(symbol: str, n: int = 320, adjustment: str = "qfq") -> list[dict]:
     p = symbol.lower() if symbol[:2].lower() in ("sh", "sz", "bj") else code_prefix(symbol) + symbol
     try:
-        d = get_json(f"https://web.ifzq.gtimg.cn/appstock/app/fqkline/get?param={p},day,,,{n},qfq", timeout=20)
+        # 日线端点偶尔会对某一标的长时间不返回。它仅用于技术指标，
+        # 因而应尽快降级为缺失，不能阻塞整份日报的收盘事实数据。
+        d = get_json(
+            f"https://web.ifzq.gtimg.cn/appstock/app/fqkline/get?param={p},day,,,{n},{adjustment}",
+            timeout=8,
+            tries=1,
+        )
         block = (d.get("data") or {}).get(p) or {}
         # 指数返回 day，个股前复权返回 qfqday。
-        raw = block.get("day") or block.get("qfqday") or []
+        raw = block.get("day") or (block.get("qfqday") if adjustment else []) or []
         rows=[]
         for x in raw:
             if len(x) < 6: continue
@@ -159,6 +180,15 @@ def kline(symbol: str, n: int = 320) -> list[dict]:
             except Exception: pass
         return rows
     except Exception: return []
+
+
+def fetch_klines(symbols: list[str], n: int = 320, max_workers: int = 8,
+                 adjustment: str = "qfq") -> dict[str, list[dict]]:
+    """Fetch independent daily series concurrently; a failed symbol remains an empty series."""
+    unique = list(dict.fromkeys(symbols))
+    with ThreadPoolExecutor(max_workers=min(max_workers, len(unique) or 1)) as pool:
+        rows = list(pool.map(lambda symbol: kline(symbol, n, adjustment=adjustment), unique))
+    return dict(zip(unique, rows))
 
 def minute_kline(symbol: str, interval: str = "m5", n: int = 320) -> list[dict]:
     """腾讯分钟K。成交量单位为手；成交额使用OHLC均价估算，不能误读第7字段。"""
@@ -191,20 +221,62 @@ def minute_kline(symbol: str, interval: str = "m5", n: int = 320) -> list[dict]:
     except Exception:
         return []
 
-def collect_intraday_klines(report_date: str, data_dir: Path) -> dict:
+def _cache_fresh(path: Path, ttl_seconds: int, now: datetime) -> bool:
+    if not path.exists():
+        return False
+    modified = datetime.fromtimestamp(path.stat().st_mtime, SH_TZ)
+    return (now - modified).total_seconds() <= ttl_seconds
+
+
+def _truncate_intraday_pack(pack: dict, as_of: datetime | None, key: str) -> dict:
+    """Return a cutoff-safe view of cached intraday data without overwriting the raw cache."""
+    if as_of is None:
+        return pack
+    trimmed = {**pack, "as_of": as_of.isoformat()}
+    if key == "symbols":
+        trimmed["symbols"] = {
+            symbol: [
+                row for row in rows
+                if datetime.fromisoformat(row["time"]) <= as_of
+            ]
+            for symbol, rows in (pack.get("symbols") or {}).items()
+        }
+    else:
+        trimmed["events"] = [
+            event for event in (pack.get("events") or [])
+            if datetime.fromisoformat(event["published_at"]) <= as_of
+        ]
+    return trimmed
+
+
+def collect_intraday_klines(
+    report_date: str,
+    data_dir: Path,
+    *,
+    mode: str = "close",
+    as_of: datetime | None = None,
+    refresh: bool = False,
+    cache_seconds: int = 120,
+) -> dict:
     cache = data_dir / "minute_indices.json"
     old = read_json_file(cache, {})
-    if old.get("report_date") == report_date and old.get("symbols"):
-        return old
+    now = datetime.now(SH_TZ)
+    reusable = mode == "close" or _cache_fresh(cache, cache_seconds, now)
+    if not refresh and reusable and old.get("report_date") == report_date and old.get("symbols"):
+        return _truncate_intraday_pack(old, as_of if mode == "intraday" else None, "symbols")
     symbols = {}
     for symbol in INTRADAY_INDEXES:
         rows = [x for x in minute_kline(symbol) if x["time"][:10] == report_date]
+        if mode == "intraday" and as_of is not None:
+            rows = [x for x in rows if datetime.fromisoformat(x["time"]) <= as_of]
         symbols[symbol] = rows
     pack = {
         "schema_version": "1.0",
         "report_date": report_date,
         "interval": "5m",
         "timezone": "Asia/Shanghai",
+        "mode": mode,
+        "as_of": as_of.isoformat() if as_of else None,
         "source": "Tencent mkline",
         "generated_at": datetime.now(SH_TZ).isoformat(),
         "symbols": symbols,
@@ -250,12 +322,23 @@ def _cls_is_a_share_relevant(item: dict) -> bool:
     )
     return any(k in text for k in keywords)
 
-def collect_timestamped_events(report_date: str, data_dir: Path, max_pages: int = 16) -> dict:
+def collect_timestamped_events(
+    report_date: str,
+    data_dir: Path,
+    max_pages: int = 16,
+    *,
+    mode: str = "close",
+    as_of: datetime | None = None,
+    refresh: bool = False,
+    cache_seconds: int = 120,
+) -> dict:
     """获取报告日财联社盘中快讯。快讯时间是候选证据，不自动等于事件发生时间。"""
     cache = data_dir / "intraday_events.json"
     old = read_json_file(cache, {})
-    if old.get("report_date") == report_date and old.get("events"):
-        return old
+    now = datetime.now(SH_TZ)
+    reusable = mode == "close" or _cache_fresh(cache, cache_seconds, now)
+    if not refresh and reusable and old.get("report_date") == report_date and old.get("events"):
+        return _truncate_intraday_pack(old, as_of if mode == "intraday" else None, "events")
     target = datetime.strptime(report_date, "%Y-%m-%d").replace(tzinfo=SH_TZ)
     stop_at = target.replace(hour=9, minute=0)
     seen, events, last_time = set(), [], ""
@@ -276,7 +359,8 @@ def collect_timestamped_events(report_date: str, data_dir: Path, max_pages: int 
             in_session = (9 * 60 + 15 <= minutes <= 11 * 60 + 30) or (
                 13 * 60 <= minutes <= 15 * 60
             )
-            if published.strftime("%Y-%m-%d") == report_date and in_session:
+            within_cutoff = mode != "intraday" or as_of is None or published <= as_of
+            if published.strftime("%Y-%m-%d") == report_date and in_session and within_cutoff:
                 title = item.get("title") or item.get("brief") or item.get("content") or ""
                 subjects = [
                     x.get("subject_name", "") for x in (item.get("subjects") or [])
@@ -311,6 +395,8 @@ def collect_timestamped_events(report_date: str, data_dir: Path, max_pages: int 
         "schema_version": "1.0",
         "report_date": report_date,
         "timezone": "Asia/Shanghai",
+        "mode": mode,
+        "as_of": as_of.isoformat() if as_of else None,
         "source": "财联社电报",
         "generated_at": datetime.now(SH_TZ).isoformat(),
         "events": events,
@@ -386,7 +472,8 @@ def pool(endpoint, date_str):
     try:
         d=get_json(url,params=params,headers={"Referer":"https://quote.eastmoney.com/"},timeout=15)
         return ((d.get("data") or {}).get("pool") or [])
-    except Exception:return []
+    except Exception:
+        return None
 
 def dragon_tiger(date_str):
     params={"reportName":"RPT_DAILYBILLBOARD_DETAILSNEW","columns":"ALL","filter":f"(TRADE_DATE>='{date_str}')(TRADE_DATE<='{date_str}')","pageNumber":"1","pageSize":"500","sortColumns":"BILLBOARD_NET_AMT","sortTypes":"-1","source":"WEB","client":"WEB"}
@@ -425,7 +512,13 @@ def announcements(code):
     org = cninfo_org_id(code)
     body=urllib.parse.urlencode({"stock":f"{code},{org}","tabName":"fulltext","pageSize":"10","pageNum":"1","column":"","category":"","plate":"","seDate":"","searchkey":"","secid":"","sortName":"","sortType":"","isHLtitle":"true"}).encode()
     try:
-        d=get_json("https://www.cninfo.com.cn/new/hisAnnouncement/query",data=body,headers={"Content-Type":"application/x-www-form-urlencoded","Referer":"https://www.cninfo.com.cn/new/disclosure"},timeout=15)
+        d=get_json(
+            "https://www.cninfo.com.cn/new/hisAnnouncement/query",
+            data=body,
+            headers={"Content-Type":"application/x-www-form-urlencoded","Referer":"https://www.cninfo.com.cn/new/disclosure"},
+            timeout=6,
+            tries=1,
+        )
         out = []
         for x in (d.get("announcements") or [])[:5]:
             ts = x.get("announcementTime")
@@ -443,6 +536,14 @@ def announcements(code):
             })
         return out
     except Exception:return []
+
+
+def fetch_announcements(codes: list[str], max_workers: int = 4) -> dict[str, list[dict]]:
+    """Supplement disclosures without allowing a slow issuer endpoint to hold up the report."""
+    unique = list(dict.fromkeys(codes))
+    with ThreadPoolExecutor(max_workers=min(max_workers, len(unique) or 1)) as pool:
+        rows = list(pool.map(announcements, unique))
+    return dict(zip(unique, rows))
 
 def news_events(news_dir: Path):
     return load_news_events(news_dir)
@@ -464,10 +565,39 @@ def _window_return(rows: list[dict], start: datetime, end: datetime):
         return None
     return pct(last["close"], first["close"])
 
-def intraday_quality(report_date: str, minute_pack: dict, events_pack: dict,
-                     quotes: dict) -> dict:
+def _expected_cn_bars(report_date: str, as_of: datetime) -> list[datetime]:
+    day = datetime.strptime(report_date, "%Y-%m-%d").replace(tzinfo=SH_TZ)
+    bars = []
+    for start, end in ((day.replace(hour=9, minute=35), day.replace(hour=11, minute=30)),
+                       (day.replace(hour=13, minute=5), day.replace(hour=15, minute=0))):
+        current = start
+        while current <= end:
+            if current <= as_of:
+                bars.append(current)
+            current += timedelta(minutes=5)
+    return bars
+
+
+def intraday_quality(
+    report_date: str,
+    minute_pack: dict,
+    events_pack: dict,
+    quotes: dict,
+    *,
+    mode: str = "close",
+    as_of: datetime | None = None,
+) -> dict:
+    as_of = as_of or datetime.strptime(report_date, "%Y-%m-%d").replace(
+        hour=15, minute=0, tzinfo=SH_TZ
+    )
+    expected_bars = _expected_cn_bars(report_date, as_of)
+    minimum_bars = 48 if mode == "close" else len(expected_bars)
+    required_end = "15:00" if mode == "close" else (
+        expected_bars[-1].strftime("%H:%M") if expected_bars else None
+    )
     checks = {}
     valid = 0
+    close_checks = cn_close_minute_checks(minute_pack.get("symbols") or {}, quotes, report_date) if mode == "close" else {}
     for symbol in INTRADAY_INDEXES:
         rows = _rows_for_symbol(minute_pack, symbol)
         first = rows[0]["minute"] if rows else ""
@@ -475,13 +605,13 @@ def intraday_quality(report_date: str, minute_pack: dict, events_pack: dict,
         quote_close = (quotes.get(symbol) or {}).get("price")
         minute_close = rows[-1]["close"] if rows else None
         close_error = abs(pct(minute_close, quote_close) or 0) if minute_close and quote_close else None
-        ok = (
-            len(rows) >= 48
-            and first <= "09:35"
-            and last >= "15:00"
-            and close_error is not None
-            and close_error <= 0.2
-        )
+        if mode == "close":
+            ok = close_checks[symbol]["valid"]
+        else:
+            ok = bool(
+                minimum_bars > 0 and len(rows) >= minimum_bars
+                and first <= "09:35" and required_end and last >= required_end
+            )
         valid += int(ok)
         checks[symbol] = {
             "bars": len(rows), "first": first or None, "last": last or None,
@@ -492,8 +622,14 @@ def intraday_quality(report_date: str, minute_pack: dict, events_pack: dict,
         e for e in (events_pack.get("events") or []) if e.get("a_share_relevant")
     ]
     coverage = valid / len(INTRADAY_INDEXES) if INTRADAY_INDEXES else 0
-    ready = coverage >= 0.8 and len(relevant_events) >= 3
+    ready = coverage >= 0.8 and (mode == "intraday" or len(relevant_events) >= 3)
     return {
+        "mode": mode,
+        "as_of": as_of.isoformat(),
+        "session_state": cn_session_state(as_of),
+        "is_final": (mode == "close" and coverage >= 0.8
+                     and not cn_close_quote_errors(quotes, as_of)
+                     and not cn_close_price_mismatches(close_checks)),
         "ready": ready,
         "core_index_coverage": coverage,
         "valid_index_count": valid,
@@ -502,12 +638,12 @@ def intraday_quality(report_date: str, minute_pack: dict, events_pack: dict,
         "a_share_relevant_event_count": len(relevant_events),
         "checks": checks,
         "rules": {
-            "minimum_bars_per_index": 48,
+            "minimum_bars_per_index": minimum_bars,
             "required_session_start": "09:35",
-            "required_session_end": "15:00",
-            "maximum_close_error_pct": 0.2,
+            "required_session_end": required_end,
+            "maximum_close_error_pct": 0.2 if mode == "close" else None,
             "minimum_core_index_coverage": 0.8,
-            "minimum_relevant_timestamped_events": 3,
+            "minimum_relevant_timestamped_events": 3 if mode == "close" else 0,
         },
     }
 
@@ -599,7 +735,8 @@ def _phase_observation(sse, csi, growth):
     return "指数表现分化"
 
 def build_intraday_section(report_date: str, minute_pack: dict, events_pack: dict,
-                           quality: dict, quotes: dict) -> tuple[str, list[dict]]:
+                           quality: dict, quotes: dict, *, mode: str = "close",
+                           as_of: datetime | None = None) -> tuple[str, list[dict]]:
     if not quality.get("ready"):
         return "", []
     day = datetime.strptime(report_date, "%Y-%m-%d").replace(tzinfo=SH_TZ)
@@ -610,6 +747,7 @@ def build_intraday_section(report_date: str, minute_pack: dict, events_pack: dic
         ("午后开盘", day.replace(hour=13, minute=5), day.replace(hour=14, minute=0)),
         ("尾盘", day.replace(hour=14, minute=0), day.replace(hour=15, minute=0)),
     ]
+    as_of = as_of or day.replace(hour=15, minute=0)
     rows = []
     for label, start, end in phases:
         if start is None:
@@ -622,6 +760,10 @@ def build_intraday_section(report_date: str, minute_pack: dict, events_pack: dic
             }
             period = "昨收→开盘"
         else:
+            if mode == "intraday" and start > as_of:
+                continue
+            if mode == "intraday" and end > as_of:
+                end = as_of
             moves = {
                 symbol: _window_return(_rows_for_symbol(minute_pack, symbol), start, end)
                 for symbol in ("sh000001", "sh000300", "sz399006")
@@ -694,9 +836,145 @@ def build_intraday_section(report_date: str, minute_pack: dict, events_pack: dic
 def html_table(headers, rows):
     return _shared_html_table(headers, rows)
 
+
+def market_snapshot(day_dir: Path, cutoff: datetime, mode: str = "intraday") -> dict:
+    """Only reuse snapshots actually captured on the report day before cutoff.
+
+    Legacy evidence is eligible by generated_at, never by its user-supplied as_of.
+    A file containing later data relabelled as an earlier cutoff is not a snapshot.
+    """
+    paths = list((day_dir / "snapshots").glob("*.json"))
+    paths += [day_dir / variant / "market_data" / "evidence.json"
+              for variant in ("intraday_latest", "close")]
+    eligible = []
+    for path in paths:
+        data = read_json_file(path, {})
+        if not isinstance(data, dict):
+            continue
+        captured = cn_timestamp(data.get("captured_at") or data.get("generated_at"))
+        # Collection may finish after generated_at (the run start). Account for
+        # every declared observation boundary when replaying an evidence file.
+        boundaries = [cn_timestamp(data.get(key)) for key in ("as_of", "snapshot_as_of")]
+        if captured:
+            captured = max([captured] + [stamp for stamp in boundaries if stamp])
+        if (captured and captured.date() == cutoff.date() and captured <= cutoff
+                and data.get("report_date") == cutoff.date().isoformat()
+                and (mode != "close" or captured.hour >= 15)):
+            # Old six-digit keys may already have overwritten another market.
+            # Their identity cannot be recovered safely from price or name.
+            old_quotes = data.get("eastmoney_quotes") or {}
+            data["eastmoney_quotes"] = {
+                key.lower(): quote for key, quote in old_quotes.items()
+                if re.fullmatch(r"(?:sh|sz|bj)\d{6}", key.lower())
+            } if isinstance(old_quotes, dict) else {}
+            eligible.append((captured, {**data, "captured_at": captured.isoformat()}))
+    return max(eligible, key=lambda item: item[0])[1] if eligible else {}
+
+
+def quotes_at_cutoff(codes, live, saved, daily, minute_pack, cutoff, mode):
+    """Accept timestamped quotes or reconstruct only fields justified by K lines."""
+    out = {}
+    day = cutoff.date().isoformat()
+    for code in codes:
+        for candidate in (live.get(code), saved.get(code)):
+            if not candidate:
+                continue
+            observed = cn_timestamp(candidate.get("time"))
+            if (observed and observed.date() == cutoff.date() and observed <= cutoff
+                    and candidate.get("price") is not None
+                    and (mode != "close" or observed >= cutoff.replace(hour=15, minute=0, second=0, microsecond=0))):
+                out[code] = {**candidate, "time": observed.isoformat()}
+                break
+        if code in out:
+            continue
+        history = sorted((r for r in daily.get(code, []) if r["date"] < day), key=lambda r: r["date"])
+        previous = history[-1]["close"] if history else None
+        if mode == "close":
+            rows = [r for r in daily.get(code, []) if r["date"] == day]
+            if not rows:
+                continue
+            row = rows[-1]
+            quote = {key: row.get(key) for key in ("open", "high", "low")}
+            quote.update(price=row["close"], time=f"{day}T15:00:00+08:00",
+                         source="Tencent unadjusted daily reconstruction")
+        else:
+            rows = sorted((r for r in (minute_pack.get("symbols") or {}).get(code, [])
+                           if (stamp := cn_timestamp(r.get("time")))
+                           and stamp.date() == cutoff.date() and stamp <= cutoff), key=lambda r: r["time"])
+            if not rows:
+                continue
+            quote = {"price": rows[-1]["close"], "time": rows[-1]["time"],
+                     "source": "Tencent completed 5m reconstruction"}
+            # Session open/high/low need all completed bars, not a partial window.
+            expected = {t.isoformat() for t in _expected_cn_bars(day, cn_timestamp(rows[-1]["time"]))}
+            if expected and expected == {cn_timestamp(r["time"]).isoformat() for r in rows}:
+                quote.update(open=rows[0].get("open"), high=max(r["high"] for r in rows),
+                             low=min(r["low"] for r in rows))
+        quote.update(name=code, last_close=previous,
+                     change_pct=pct(quote["price"], previous), reconstructed=True)
+        out[code] = quote
+    return out
+
+
+def events_at_cutoff(events, cutoff):
+    # A merged RSS event can include later articles: use its latest publication.
+    return [event for event in events if
+            (stamp := cn_timestamp(event.get("last_updated_at") or event.get("published_at")))
+            and stamp <= cutoff]
+
+
+def us_reference(runs_root: Path, cutoff: datetime) -> dict:
+    """Pick completed US daily observations, with explicit dates for stale data."""
+    expected = latest_completed_us_session(cutoff)
+    assets = {}
+    for path in sorted((runs_root / "us").glob("*/market_data/evidence.json"), reverse=True):
+        pack_day = path.parents[1].name
+        try:
+            pack_close = us_session_close(datetime.fromisoformat(pack_day).date())
+        except ValueError:
+            continue
+        if pack_close is None or pack_day > expected:
+            continue
+        data = read_json_file(path, {})
+        if not isinstance(data, dict) or data.get("report_date") != pack_day:
+            continue
+        generated = cn_timestamp(data.get("generated_at"))
+        for symbol in ("SPY", "QQQ", "SMH"):
+            block = data.get(symbol) or {}
+            if not isinstance(block, dict):
+                continue
+            rows = []
+            for row in block.get("rows") or []:
+                if not isinstance(row, dict) or not finite_number(row.get("close")) or row["close"] <= 0:
+                    continue
+                try:
+                    close = us_session_close(datetime.fromisoformat(row["date"]).date())
+                except (ValueError, KeyError, TypeError):
+                    continue
+                if (close is not None and close <= cutoff and row["date"] <= pack_day
+                        and (generated is None or close <= generated)):
+                    rows.append(row)
+            rows.sort(key=lambda row: row["date"])
+            if not rows or (symbol in assets and rows[-1]["date"] <= assets[symbol]["date"]):
+                continue
+            last = rows[-1]
+            previous_day = latest_completed_us_session(
+                us_session_close(datetime.fromisoformat(last["date"]).date()) - timedelta(microseconds=1))
+            previous = next((row for row in reversed(rows[:-1]) if row["date"] == previous_day), None)
+            assets[symbol] = {"date": last["date"], "close": last["close"],
+                              "change_pct": pct(last["close"], previous["close"]) if previous else None,
+                              "stale": last["date"] != expected, "evidence_path": str(path)}
+        if len(assets) == 3 and all(row["date"] == expected for row in assets.values()):
+            break
+    return {"expected_date": expected, "as_of": cutoff.isoformat(), "assets": assets}
+
 def main(
     report_date: str | None = None,
     *,
+    mode: str = "close",
+    as_of: datetime | None = None,
+    refresh: bool = False,
+    cache_seconds: int = 120,
     template: Path | None = None,
     reports_dir: Path | None = None,
     runs_dir: Path | None = None,
@@ -710,50 +988,128 @@ def main(
     REPORTS = Path(reports_dir) if reports_dir else ROOT / "reports"
     DATA_ROOT = (Path(runs_dir) if runs_dir else ROOT / "runs") / "cn"
     now=datetime.now(SH_TZ)
+    requested_cutoff = as_of
+    as_of = (as_of or now).astimezone(SH_TZ)
+    if mode not in {"intraday", "close"}:
+        raise ValueError("A股 mode 必须是 intraday 或 close")
     # Index K-line is the source of truth for the last completed exchange session.
-    idx_k={s:kline(s,320) for s,_ in INDEXES[:1]}
+    idx_k=fetch_klines([s for s,_ in INDEXES[:1]], 320)
     candidate_dates=[r["date"] for r in idx_k.get("sh000001",[]) if r["date"] <= now.strftime("%Y-%m-%d")]
-    report_date=report_date or (candidate_dates[-1] if candidate_dates else now.strftime("%Y-%m-%d"))
-    news_dir=DATA_ROOT/report_date/"news"; data_dir=DATA_ROOT/report_date/"market_data"; data_dir.mkdir(parents=True,exist_ok=True); REPORTS.mkdir(exist_ok=True)
+    if mode == "intraday":
+        report_date = report_date or as_of.date().isoformat()
+    else:
+        report_date=report_date or (candidate_dates[-1] if candidate_dates else now.strftime("%Y-%m-%d"))
+    report_day = datetime.strptime(report_date, "%Y-%m-%d").replace(tzinfo=SH_TZ)
+    rolling_live = requested_cutoff is None and report_day.date() == now.date()
+    if requested_cutoff is None and report_day.date() != now.date():
+        if mode == "intraday":
+            raise ValueError("历史盘中报告必须指定 --as-of HH:MM")
+        as_of = report_day.replace(hour=23, minute=59, second=59)
+    if as_of.date() != report_day.date():
+        raise ValueError("截止时间必须属于报告日期")
+    if as_of > now:
+        raise ValueError("报告截止时间不能晚于当前时间")
+    if mode == "close" and as_of < report_day.replace(hour=15):
+        raise ValueError("收盘报告截止时间不能早于15:00")
+    # Replay uses unadjusted history: later corporate actions must not rewrite
+    # the reconstructed historical quote through today's forward adjustment.
+    adjustment = "qfq" if rolling_live else ""
+    variant = "intraday_latest" if mode == "intraday" else "close"
+    run_dir = DATA_ROOT/report_date/variant
+    news_dir=DATA_ROOT/report_date/"news"
+    data_dir=run_dir/"market_data"
+    data_dir.mkdir(parents=True,exist_ok=True); REPORTS.mkdir(exist_ok=True)
+    saved = market_snapshot(DATA_ROOT / report_date, as_of, mode)
     codes=[s for s,_ in INDEXES]+POOL
     try: tq=tencent_quotes(codes)
     except Exception: tq={}
-    minute_pack = collect_intraday_klines(report_date, data_dir)
-    timestamped_events_pack = collect_timestamped_events(report_date, data_dir)
-    # Preserve explicit sh/sz prefixes for ambiguous 000xxx index codes.
-    try: eq=em_quotes([x for x,_ in INDEXES]+POOL)
-    except Exception: eq={}
-    kl={}
-    for s,_ in INDEXES:
-        kl[s]=idx_k.get(s) or kline(s,320)
-    for c in POOL: kl[c]=kline(c,320)
-    tech={c:technical(kl.get(c,[]),report_date) for c in codes}
-    inds=industry_rows(); flow_ind=board_flow("industry","today"); flow_con=board_flow("concept","today")
-    zt=pool("getTopicZTPool",report_date); zb=pool("getTopicZBPool",report_date); dt=pool("getTopicDTPool",report_date); yzt=pool("getYesterdayZTPool",report_date)
+    minute_pack = collect_intraday_klines(
+        report_date, data_dir, mode=mode, as_of=as_of, refresh=refresh,
+        cache_seconds=cache_seconds,
+    )
+    timestamped_events_pack = collect_timestamped_events(
+        report_date, data_dir, mode=mode, as_of=as_of, refresh=refresh,
+        cache_seconds=cache_seconds,
+    )
+    # These endpoints expose current snapshots, not point-in-time history.
+    if rolling_live:
+        try: eq=em_quotes([x for x,_ in INDEXES]+POOL)
+        except Exception: eq={}
+        inds=industry_rows(); flow_ind=board_flow("industry","today"); flow_con=board_flow("concept","today")
+        pool_results = [pool(endpoint, report_date) for endpoint in
+                        ("getTopicZTPool", "getTopicZBPool", "getTopicDTPool", "getYesterdayZTPool")]
+    else:
+        eq = saved.get("eastmoney_quotes") or {}
+        inds = saved.get("industries") or []
+        flow_ind = saved.get("industry_flow") or []
+        flow_con = saved.get("concept_flow") or []
+        pool_results = saved.get("limit_pools") or [None] * 4
+    snapshot_time = datetime.now(SH_TZ) if rolling_live else cn_timestamp(saved.get("captured_at"))
+    kl = fetch_klines([s for s, _ in INDEXES] + POOL, 320, adjustment=adjustment)
+    for s, _ in INDEXES:
+        if not kl.get(s):
+            kl[s] = idx_k.get(s, [])
+    limit_pool_available = all(result is not None for result in pool_results)
+    zt, zb, dt, yzt = [result or [] for result in pool_results]
     # Secondary pull for limit-up candidates shown in the正文 table.
     limit_codes=[x.get("c") for x in sorted(zt,key=lambda a:(a.get("lbc") or 0,a.get("fund") or 0),reverse=True)[:8] if x.get("c")]
     if limit_codes:
         try: tq.update(tencent_quotes(limit_codes))
         except Exception: pass
-    for c in limit_codes:
-        if c not in kl: kl[c]=kline(c,80)
-        tech[c]=technical(kl.get(c,[]),report_date)
-    lhb=dragon_tiger(report_date)
-    ev=news_events(news_dir)
+    extra_limit_codes = [c for c in limit_codes if c not in kl]
+    if extra_limit_codes:
+        kl.update(fetch_klines(extra_limit_codes, 80, adjustment=adjustment))
+    if rolling_live:
+        as_of = datetime.now(SH_TZ)
+    tq = quotes_at_cutoff(list(dict.fromkeys(codes + limit_codes)), tq,
+                          saved.get("quotes") or {}, kl, minute_pack, as_of, mode)
+    # Do not let a previous day's close appear as today's intraday price.
+    technical_date = (report_day - timedelta(days=1)).date().isoformat() if mode == "intraday" else report_date
+    tech = {c: technical(kl.get(c, []), technical_date) for c in codes + limit_codes}
+    if mode == "intraday":
+        for c, values in tech.items():
+            quote = tq.get(c) or {}
+            values.update(close=quote.get("price"), day=quote.get("change_pct"),
+                          vol_ratio=quote.get("vol_ratio"))
+    else:
+        tech = {c: values if values.get("last_date") == report_date else technical([], report_date)
+                for c, values in tech.items()}
+    lhb = ((dragon_tiger(report_date) if rolling_live else saved.get("dragon_tiger") or [])
+           if mode == "close" else [])
     ranked_pool = sorted(
         [c for c in POOL if (tq.get(c) or {}).get("change_pct") is not None],
         key=lambda c: abs((tq.get(c) or {}).get("change_pct") or 0),
         reverse=True,
     )
     announcement_codes = list(dict.fromkeys(limit_codes + ranked_pool))[:10]
-    announcements_pack={c:announcements(c) for c in announcement_codes}
-    quality = intraday_quality(report_date, minute_pack, timestamped_events_pack, tq)
+    announcements_pack=fetch_announcements(announcement_codes) if mode == "close" else {}
+    if rolling_live:
+        as_of = datetime.now(SH_TZ)
+        snapshot_dir = DATA_ROOT / report_date / "snapshots"
+        snapshot_dir.mkdir(parents=True, exist_ok=True)
+        snapshot = {"report_date": report_date, "captured_at": as_of.isoformat(),
+                    "quotes": tq, "eastmoney_quotes": eq, "industries": inds,
+                    "industry_flow": flow_ind, "concept_flow": flow_con,
+                    "limit_pools": pool_results, "dragon_tiger": lhb}
+        (snapshot_dir / f"{as_of:%H%M%S_%f}.json").write_text(
+            json.dumps(snapshot, ensure_ascii=False, indent=2), encoding="utf-8")
+    ev=events_at_cutoff(news_events(news_dir), as_of)
+    announcements_pack = {code: events_at_cutoff(items, as_of)
+                          for code, items in announcements_pack.items()}
+    quality = intraday_quality(
+        report_date, minute_pack, timestamped_events_pack, tq,
+        mode=mode, as_of=as_of,
+    )
     intraday_section, aligned_events = build_intraday_section(
-        report_date, minute_pack, timestamped_events_pack, quality, tq
+        report_date, minute_pack, timestamped_events_pack, quality, tq,
+        mode=mode, as_of=as_of,
     )
     alignment_pack = {
         "schema_version": "1.0",
         "report_date": report_date,
+        "mode": mode,
+        "as_of": as_of.isoformat(),
+        "is_final": quality.get("is_final", False),
         "generated_at": now.isoformat(),
         "quality": quality,
         "alignments": aligned_events,
@@ -762,21 +1118,35 @@ def main(
     (data_dir/"intraday_alignment.json").write_text(
         json.dumps(alignment_pack,ensure_ascii=False,indent=2)
     )
-    evidence={"report_date":report_date,"generated_at":now.isoformat(),"quotes":tq,"eastmoney_quotes":eq,"technical":tech,"industries":inds,"industry_flow":flow_ind,"concept_flow":flow_con,"limit_up_count":len(zt),"break_count":len(zb),"limit_down_count":len(dt),"yesterday_limit_count":len(yzt),"dragon_tiger":lhb[:50],"announcements":announcements_pack,"intraday_quality":quality,"intraday_outputs":{"minute_indices":"minute_indices.json","timestamped_events":"intraday_events.json","alignment":"intraday_alignment.json"}}
+    evidence={"schema_version":"1.1","market":"cn","report_type":mode,"report_date":report_date,"as_of":as_of.isoformat(),"session_state":quality.get("session_state"),"is_final":quality.get("is_final",False),"generated_at":now.isoformat(),"quotes":tq,"eastmoney_quotes":eq,"technical":tech,"technical_cutoff":technical_date,"industries":inds,"industry_flow":flow_ind,"concept_flow":flow_con,"limit_pool_available":limit_pool_available,"limit_up_count":len(zt) if limit_pool_available else None,"break_count":len(zb) if limit_pool_available else None,"limit_down_count":len(dt) if limit_pool_available else None,"yesterday_limit_count":len(yzt) if limit_pool_available else None,"dragon_tiger":lhb[:50],"announcements":announcements_pack,"intraday_quality":quality,"intraday_outputs":{"minute_indices":"minute_indices.json","timestamped_events":"intraday_events.json","alignment":"intraday_alignment.json"}}
+    evidence.update(snapshot_as_of=snapshot_time.isoformat() if snapshot_time else None,
+                    daily_price_basis="unadjusted" if not adjustment else adjustment,
+                    limit_pools=pool_results,
+                    cutoff_policy="timestamped quotes; eligible snapshots; K-line reconstruction; otherwise missing")
+    cross_market = us_reference(DATA_ROOT.parent, as_of)
+    evidence["cross_market"] = cross_market
     (data_dir/"evidence.json").write_text(json.dumps(evidence,ensure_ascii=False,indent=2))
-    return render(report_date,now,tq,eq,tech,kl,inds,flow_ind,flow_con,zt,zb,dt,yzt,lhb,ev,announcements_pack,news_dir,data_dir,intraday_section,quality,timestamped_events_pack)
+    return render(report_date,now,tq,eq,tech,kl,inds,flow_ind,flow_con,zt,zb,dt,yzt,lhb,ev,announcements_pack,news_dir,data_dir,intraday_section,quality,timestamped_events_pack,mode=mode,as_of=as_of,limit_pool_available=limit_pool_available,cross_market=cross_market)
 
-def render(report_date,now,tq,eq,tech,kl,inds,flow_ind,flow_con,zt,zb,dt,yzt,lhb,ev,announcements_pack,news_dir,data_dir,intraday_section,quality,timestamped_events_pack):
+def render(report_date,now,tq,eq,tech,kl,inds,flow_ind,flow_con,zt,zb,dt,yzt,lhb,ev,announcements_pack,news_dir,data_dir,intraday_section,quality,timestamped_events_pack,*,mode="close",as_of=None,limit_pool_available=True,cross_market=None):
+    as_of = (as_of or now).astimezone(SH_TZ)
+    is_intraday = mode == "intraday"
+    price_label = "最新价" if is_intraday else "收盘"
     def q(symbol):
         raw=tq.get(symbol) or {}
-        e=eq.get(symbol.replace("sh","").replace("sz","").replace("bj","") ,{})
+        e=eq.get(market_symbol(symbol), {})
         z={**e,**{k:v for k,v in raw.items() if v is not None}}
         return z
+    def ma20_state(snapshot):
+        close, ma20 = snapshot.get("close"), snapshot.get("ma20")
+        if close is None or ma20 is None:
+            return "未取得"
+        return "MA20上方" if close > ma20 else "MA20下方"
     idxrows=[]
     for s,n in INDEXES:
         z=q(s); t=tech.get(s,{})
-        idxrows.append([f"<strong>{n}</strong><br><span class='muted'>{s[-6:]}</span>",fmt_num(z.get("price"),2),fmt_pct(z.get("change_pct")),fmt_num(z.get("high"),2)+" / "+fmt_num(z.get("low"),2),fmt_money_yi((z.get("amount_wan") or 0)*1e4),fmt_pct(t.get("r5")),fmt_pct(t.get("r20")),"MA20上方" if t.get("close") and t.get("ma20") and t["close"]>t["ma20"] else "MA20下方"])
-    market_html=html_table(["标的","收盘","涨跌","日内高/低","成交额","5日","20日","技术状态"],idxrows)
+        idxrows.append([f"<strong>{n}</strong><br><span class='muted'>{s[-6:]}</span>",fmt_num(z.get("price"),2),fmt_pct(z.get("change_pct")),fmt_num(z.get("high"),2)+" / "+fmt_num(z.get("low"),2),fmt_amount_wan(z.get("amount_wan")),fmt_pct(t.get("r5")),fmt_pct(t.get("r20")),ma20_state(t)])
+    market_html=html_table(["标的",price_label,"涨跌","日内高/低","成交额","5日","20日","技术状态"],idxrows)
     # Representative sector baskets, used when board index endpoint is unavailable.
     sec=[]
     for name,members in SECTOR_BASKETS.items():
@@ -792,9 +1162,12 @@ def render(report_date,now,tq,eq,tech,kl,inds,flow_ind,flow_con,zt,zb,dt,yzt,lhb
     style_html=html_table(["风格","当日","5日"],style)
     themes="<ul>"+"".join(f"<li>{html.escape(e.get('headline',''))} <span class='tag'>{html.escape(str(e.get('topic','')))}</span> <span class='muted'>[S4]</span></li>" for e in ev[:8])+"</ul>"
     # Breadth: direct limit-pool counts plus index constituent counts where available.
-    breadth_rows=[["上证指数成分上涨/下跌",f"{eq.get('000001',{}).get('up_count','未取得')} / {eq.get('000001',{}).get('down_count','未取得')}","指数成分统计代理"],["沪深300成分上涨/下跌",f"{eq.get('000300',{}).get('up_count','未取得')} / {eq.get('000300',{}).get('down_count','未取得')}","指数成分统计"],["涨停家数",len(zt),"打板池"],["炸板家数",len(zb),"打板池"],["跌停家数",len(dt),"打板池"],["昨日涨停池",len(yzt),"昨日涨停跟踪"]]
+    limit_pool_value = (lambda value: value if limit_pool_available else "未取得")
+    breadth_rows=[["上证指数成分上涨/下跌",f"{eq.get('sh000001',{}).get('up_count','未取得')} / {eq.get('sh000001',{}).get('down_count','未取得')}","指数成分统计代理"],["沪深300成分上涨/下跌",f"{eq.get('sh000300',{}).get('up_count','未取得')} / {eq.get('sh000300',{}).get('down_count','未取得')}","指数成分统计"],["涨停家数",limit_pool_value(len(zt)),"打板池"],["炸板家数",limit_pool_value(len(zb)),"打板池"],["跌停家数",limit_pool_value(len(dt)),"打板池"],["昨日涨停池",limit_pool_value(len(yzt)),"昨日涨停跟踪"]]
     breadth_html=html_table(["指标","报告日","口径"],breadth_rows)
-    breadth_comment=f'<p class="note">涨停{len(zt)}家、炸板{len(zb)}家、跌停{len(dt)}家；炸板率={len(zb)/(len(zt)+len(zb))*100:.1f}%（若分母非零）。全市场直接涨跌家数未取得，未用指数成分统计冒充全市场。</p>'
+    break_denominator = len(zt) + len(zb)
+    break_rate = f"{len(zb) / break_denominator * 100:.1f}%" if break_denominator else "未取得（无涨停或炸板样本）"
+    breadth_comment=(f'<p class="note">涨停{len(zt)}家、炸板{len(zb)}家、跌停{len(dt)}家；炸板率={break_rate}。全市场直接涨跌家数未取得，未用指数成分统计冒充全市场。</p>' if limit_pool_available else '<p class="note">涨停、炸板、跌停及昨日涨停池接口未取得，本节不将缺失写为零。</p>')
     pool_map={x.get("c"):x for x in zt+zb+dt}
     movers=[]
     # dual channel: limit pool first, then fixed pool by absolute movement
@@ -806,26 +1179,29 @@ def render(report_date,now,tq,eq,tech,kl,inds,flow_ind,flow_con,zt,zb,dt,yzt,lhb
     for c in selected[:15]:
         z=q(c); t=tech.get(c,{}) ; p=pool_map.get(c,{})
         name=z.get("name") or c; reason=p.get("hybk") or "固定观察池/全市场异动"
-        movers.append([f"<strong>{html.escape(str(name))}</strong><br><span class='muted'>{c}</span>",fmt_pct(z.get("change_pct")),fmt_money_yi((z.get("amount_wan") or 0)*1e4),fmt_num(t.get("vol_ratio"),2)+"x",fmt_num(z.get("turnover_pct"),2)+"%",html.escape(str(reason)),"涨停/异动池" if c in pool_map else "固定池", "深入研究候选" if c in selected[:5] else "等待证据"])
+        movers.append([f"<strong>{html.escape(str(name))}</strong><br><span class='muted'>{c}</span>",fmt_pct(z.get("change_pct")),fmt_amount_wan(z.get("amount_wan")),fmt_num(t.get("vol_ratio"),2)+"x",fmt_num(z.get("turnover_pct"),2)+"%",html.escape(str(reason)),"涨停/异动池" if c in pool_map else "固定池", "深入研究候选" if c in selected[:5] else "等待证据"])
     movers_html=html_table(["股票","涨跌","成交额","量比","换手率","板块/原因","信号","研究状态"],movers)
     news_top=ev[:10]
     macro=[e for e in ev if e.get("topic") in ("macro","policy","energy")][:6]
     macro_html="<ul>"+"".join(f"<li>{html.escape(e.get('headline',''))} <span class='muted'>[S4]</span></li>" for e in macro)+"</ul>" if macro else '<p class="muted">未取得明确宏观事件。</p>'
-    macro_table=html_table(["变量","最新值","口径"],[["人民币/资金面","未取得","本次未补充可靠官方序列"],["全市场成交额",fmt_money_yi(sum((q(s).get("amount_wan") or 0)*1e4 for s,_ in [("sh000001",""),("sz399001","")])),"上证+深证指数成交额合计代理"],["涨停/炸板","%d / %d"%(len(zt),len(zb)),"打板池"]])
+    index_amounts = [q(symbol).get("amount_wan") for symbol in ("sh000001", "sz399001")]
+    market_turnover = sum(index_amounts) * 1e4 if all(value is not None for value in index_amounts) else None
+    macro_table=html_table(["变量","最新值","口径"],[["人民币/资金面","未取得","本次未补充可靠官方序列"],["全市场成交额",fmt_money_yi(market_turnover),"上证+深证指数成交额合计代理"],["涨停/炸板",("%d / %d"%(len(zt),len(zb))) if limit_pool_available else "未取得","打板池"]])
+    cross_market = cross_market or {"expected_date": latest_completed_us_session(as_of), "assets": {}}
     cross_rows=[]
-    try:
-        us=json.loads((ROOT/"runs/us/2026-07-29/market_data/evidence.json").read_text())
-        for s,n in [("SPY","标普500"),("QQQ","纳指100"),("SMH","半导体ETF")]:
-            x=us.get(s,{})
-            rows=x.get("rows",[]); close=rows[-1].get("close") if rows else None; prev=rows[-2].get("close") if len(rows)>1 else None
-            cross_rows.append([n,fmt_num(close),fmt_pct(pct(close,prev)),"美股前一完整交易日 [S6]"])
-    except Exception: cross_rows=[]
-    cross_html=html_table(["资产","最新值","日变动","口径"],cross_rows) if cross_rows else '<p class="muted">未取得可靠跨市场数据。</p>'
+    for s,n in [("SPY","标普500"),("QQQ","纳指100"),("SMH","半导体ETF")]:
+        observation = cross_market["assets"].get(s) or {}
+        label = ("过期参考" if observation.get("stale") else "最近完整交易日") if observation else "未取得"
+        cross_rows.append([n,fmt_num(observation.get("close")),fmt_pct(observation.get("change_pct")),
+                           observation.get("date", "未取得"), label + " [S6]"])
+    cross_html = ('<p class="note">截至报告时间，最近已完成美股交易日：'
+                  + cross_market["expected_date"] + ' ET；更早数据明确标记为过期参考。</p>'
+                  + html_table(["资产","收盘值","日变动","实际数据日期（ET）","口径"],cross_rows))
     tech_rows=[]
     for s,n in INDEXES[:7]:
         z=tech.get(s,{})
-        tech_rows.append([n,fmt_num(z.get("close")),fmt_num(z.get("ma20")),fmt_num(z.get("ma50")),fmt_num(z.get("ma200")),fmt_num(z.get("rsi"),1),z.get("macd") or "未取得",fmt_num(z.get("vol_ratio"),2)+"x","MA20上方" if z.get("close") and z.get("ma20") and z["close"]>z["ma20"] else "MA20下方"])
-    technical_html=html_table(["标的","收盘","MA20","MA50","MA200","RSI14","MACD","量比","趋势"],tech_rows)
+        tech_rows.append([n,fmt_num(z.get("close")),fmt_num(z.get("ma20")),fmt_num(z.get("ma50")),fmt_num(z.get("ma200")),fmt_num(z.get("rsi"),1),z.get("macd") or "未取得",fmt_num(z.get("vol_ratio"),2)+"x",ma20_state(z)])
+    technical_html=html_table(["标的",price_label,"MA20","MA50","MA200","RSI14","MACD","量比","趋势"],tech_rows)
     lhb_rows=[[x.get("code"),html.escape(str(x.get("name"))),html.escape(str(x.get("reason") or "未取得"))[:80],fmt_money_yi((x.get("net") or 0)*1e4),fmt_pct(x.get("change")),fmt_num(x.get("turnover"),2)+"%"] for x in lhb[:12]]
     disclosure_html=html_table(["代码","公司","上榜/披露原因","净买入","涨跌","换手率"],lhb_rows) if lhb_rows else '<p class="muted">未取得报告日龙虎榜。</p>'
     future_html=html_table(["日期","公司","事件类型","已确认日期/窗口","关注点"],[["未来3个交易日","未取得","预约披露","未取得","以交易所/公司公告为准"],["收盘后","见新闻候选","公开新闻","已抓取原始RSS","需回到原始公告核验"]])
@@ -837,36 +1213,54 @@ def render(report_date,now,tq,eq,tech,kl,inds,flow_ind,flow_con,zt,zb,dt,yzt,lhb
         f"{news_window.get('start','未取得')}–{news_window.get('end','未取得')}"
     )
     intraday_event_count = quality.get("a_share_relevant_event_count", 0)
-    sources='<ol><li>[S1] 腾讯财经行情与K线（HTTP）：指数、个股行情、日K及5分钟K、成交量、成交额和换手率；分钟数据按报告日缓存于 '+html.escape(str(data_dir/"minute_indices.json"))+'；as_of '+html.escape(now.strftime('%Y-%m-%d %H:%M Asia/Shanghai'))+'。</li><li>[S2] 东财 push2/ulist：指数成分涨跌统计；板块排名接口失败时不将空结果当作数据。</li><li>[S3] 东财 push2ex：涨停、炸板、跌停、昨日涨停池；交易日 '+report_date+'。</li><li>[S4] scan-market-news CN证据包：'+html.escape(str(news_dir))+'；'+html.escape(news_desc)+'。</li><li>[S5] 东财 datacenter：报告日龙虎榜；仅覆盖满足披露条件的证券。</li><li>[S6] global-stock-data已有证据包：美股前一完整交易日跨市场行情，仅在第12节作为外部联动参考。</li><li>[S7] 财联社电报：报告日交易时段带发布时间快讯，A股相关候选 '+str(intraday_event_count)+' 条；发布时间不自动等于事件发生时间，时间对齐不自动证明价格因果。</li><li>[S8] 巨潮资讯：重点异动股票公告及披露时间；仅正式公告标记为官方事件。</li></ol>'
+    reference_paths = sorted({row["evidence_path"] for row in cross_market["assets"].values()})
+    source_note = ("[S6] 配置运行目录中的美股日线证据；最近已完成交易日 "
+                   + cross_market["expected_date"] + " ET；实际日期及过期状态见跨市场表。证据文件："
+                   + html.escape("；".join(reference_paths) or "未取得") + "。")
+    sources='<ol><li>[S1] 腾讯财经行情与K线（HTTP）：指数、个股行情、日K及5分钟K、成交量、成交额和换手率；分钟数据缓存于 '+html.escape(str(data_dir/"minute_indices.json"))+'；as_of '+html.escape(as_of.strftime('%Y-%m-%d %H:%M Asia/Shanghai'))+'。</li><li>[S2] 东财 push2/ulist：指数成分涨跌统计；板块排名接口失败时不将空结果当作数据。</li><li>[S3] 东财 push2ex：涨停、炸板、跌停、昨日涨停池；交易日 '+report_date+'。</li><li>[S4] scan-market-news CN证据包：'+html.escape(str(news_dir))+'；'+html.escape(news_desc)+'。</li><li>[S5] 东财 datacenter：报告日龙虎榜；仅收盘模式获取。</li><li>'+source_note+'</li><li>[S7] 财联社电报：报告日交易时段带发布时间快讯，A股相关候选 '+str(intraday_event_count)+' 条；发布时间不自动等于事件发生时间，时间对齐不自动证明价格因果。</li><li>[S8] 巨潮资讯：重点异动股票公告及披露时间；仅收盘模式补充重点公告。</li></ol>'
     q0=q("sh000001"); q3=q("sh000300"); qg=q("sz399006"); sz=q("sz399001")
-    turnover=(q0.get("amount_wan") or 0)+(sz.get("amount_wan") or 0)
+    turnover = market_turnover / 1e4 if market_turnover is not None else None
     values={
-      "REPORT_DATE_SHANGHAI":report_date,"MARKET_PHASE":"A股收盘复盘","GENERATED_AT_SHANGHAI":now.strftime("%Y-%m-%d %H:%M:%S Asia/Shanghai"),"DATA_AS_OF":now.strftime("%Y-%m-%d %H:%M Asia/Shanghai"),"SESSION_SCOPE":"集合竞价、上午盘、下午盘；收盘后公告单独标注",
-      "SSE_CLOSE":fmt_num(q0.get("price")),"SSE_CHANGE":fmt_pct(q0.get("change_pct")),"CSI300_CLOSE":fmt_num(q3.get("price")),"CSI300_CHANGE":fmt_pct(q3.get("change_pct")),"CHINEXT_CLOSE":fmt_num(qg.get("price")),"CHINEXT_CHANGE":fmt_pct(qg.get("change_pct")),"TOTAL_TURNOVER":fmt_money_yi(turnover*1e4),"TURNOVER_CHANGE":f'<span class="muted">成交额变化：未取得同口径前值</span>',
+      "REPORT_DATE_SHANGHAI":report_date,"MARKET_PHASE":"A股盘中快报" if is_intraday else "A股收盘复盘","GENERATED_AT_SHANGHAI":now.strftime("%Y-%m-%d %H:%M:%S Asia/Shanghai"),"DATA_AS_OF":as_of.strftime("%Y-%m-%d %H:%M Asia/Shanghai"),"SESSION_SCOPE":"盘中快照，数据未经收盘确认" if is_intraday else "集合竞价、上午盘、下午盘；收盘后公告单独标注",
+      "SSE_CLOSE":fmt_num(q0.get("price")),"SSE_CHANGE":fmt_pct(q0.get("change_pct")),"CSI300_CLOSE":fmt_num(q3.get("price")),"CSI300_CHANGE":fmt_pct(q3.get("change_pct")),"CHINEXT_CLOSE":fmt_num(qg.get("price")),"CHINEXT_CHANGE":fmt_pct(qg.get("change_pct")),"TOTAL_TURNOVER":fmt_amount_wan(turnover),"TURNOVER_CHANGE":f'<span class="muted">成交额变化：未取得同口径前值</span>',
       "FIRST_READ_HTML":''.join(f'<div class="decision"><small>{a}</small><strong>{b}</strong></div>' for a,b in [("核心变化","指数与成长风格是否同步"),("主线",""+sec[0]["name"] if sec else "未取得"),("已反映/待验证","价格先行，公告与资金需验证"),("下一验证点","成交额、宽度与涨停梯队")]),
-      "EXECUTIVE_SUMMARY_HTML":f'<p class="lead">{report_date} A股收盘：上证指数 {fmt_pct(q0.get("change_pct"))}，沪深300 {fmt_pct(q3.get("change_pct"))}，创业板指 {fmt_pct(qg.get("change_pct"))}；全市场成交额以沪深指数成交额合计为代理。涨停{len(zt)}家、炸板{len(zb)}家、跌停{len(dt)}家。[S1][S3]</p>',"MARKET_STATUS":"结构性轮动/风险偏好分化",
+      "EXECUTIVE_SUMMARY_HTML":f'<p class="lead">{report_date} A股{"截至 "+as_of.strftime("%H:%M") if is_intraday else "收盘"}：上证指数 {fmt_pct(q0.get("change_pct"))}，沪深300 {fmt_pct(q3.get("change_pct"))}，创业板指 {fmt_pct(qg.get("change_pct"))}；成交额以沪深指数成交额合计为代理。{"涨停"+str(len(zt))+"家、炸板"+str(len(zb))+"家、跌停"+str(len(dt))+"家。" if limit_pool_available else "涨跌停池未取得。"}{"以上均为盘中快照，未经收盘确认。" if is_intraday else ""}[S1][S3]</p>',"MARKET_STATUS":"盘中结构性分化/待收盘确认" if is_intraday else "结构性轮动/风险偏好分化",
       "MARKET_OVERVIEW_TABLE_HTML":market_html,"RISK_APPETITE_HTML":f'<p class="note">以沪深300、中证1000、创业板指、涨跌停与炸板率联合判断风险偏好；全市场直接涨跌家数本次未取得。[S1][S3]</p>',
       "INTRADAY_SECTION_HTML":intraday_section,
       "MACRO_LIQUIDITY_TABLE_HTML":macro_table,"CROSS_ASSET_TABLE_HTML":cross_html,"MACRO_EVENTS_HTML":macro_html,
       "INDUSTRY_ROTATION_TABLE_HTML":sector_html,"THEME_ROTATION_HTML":themes,"STYLE_ROTATION_HTML":style_html,"SECTOR_TRANSMISSION_HTML":f'<p class="note">{flow_note}；如无明确板块资金字段，不使用“资金流入/流出”作为事实表述。</p>',
-      "BREADTH_TABLE_HTML":breadth_html,"BREADTH_COMMENTARY_HTML":breadth_comment,"TECHNICAL_TABLE_HTML":technical_html,"TECHNICAL_COMMENTARY_HTML":'<p>核心指数日K至少取260个有效交易日，MA200不足时显示“未取得”；量比为报告日成交量除以前20个交易日平均成交量。[S1]</p>',
+      "BREADTH_TABLE_HTML":breadth_html,"BREADTH_COMMENTARY_HTML":breadth_comment,"TECHNICAL_TABLE_HTML":technical_html,"TECHNICAL_COMMENTARY_HTML":('<p>均线、RSI和区间收益截至前一完整交易日；最新价与盘中量比来自实时行情，均为临时状态。[S1]</p>' if is_intraday else '<p>核心指数日K至少取260个有效交易日，MA200不足时显示“未取得”；量比为报告日成交量除以前20个交易日平均成交量。[S1]</p>'),
       "IDEA_FUNNEL_HTML":'<p class="note">异动候选采用固定观察池＋涨停/炸板/跌停池双通道；正文最多展示15只，原因缺失时不补写单一催化剂。</p>',"MOVERS_TABLE_HTML":movers_html,
       "DISCLOSURE_RECAP_TABLE_HTML":disclosure_html,"EVENT_CALENDAR_TABLE_HTML":future_html,"EARNINGS_ANALYSIS_HTML":'<p>本版未取得可统一核验的未来3个交易日预约披露明细；不将媒体标题写成正式业绩事实。</p>',
       "POSITIONING_SIGNALS_HTML":f'<p>报告日龙虎榜记录 {len(lhb)} 条；融资融券、股东户数和大宗交易本次未做全市场横截面补充，避免把单项数据当作全市场资金结论。[S5]</p>',"EVENT_ANALYSIS_HTML":'<p>重大事件只保留原始新闻候选，需以公司公告、交易所文件或监管材料二次核验。[S4]</p>',
-      "UZI_CANDIDATES_HTML":'<p><strong>重点观察：</strong>'+"、".join(f"{q(c).get('name') or c}（{c}）" for c in selected[:5])+"。</p>","GLOBAL_LINKAGE_HTML":'<p>美股前一完整交易日的标普、纳指和半导体ETF数据作为外部联动参考；A股映射仍需下一交易日价格和成交额确认。[S6]</p>',
+      "UZI_CANDIDATES_HTML":'<p><strong>重点观察：</strong>'+"、".join(f"{q(c).get('name') or c}（{c}）" for c in selected[:5])+"。</p>","GLOBAL_LINKAGE_HTML":'<p>跨市场参考按各资产实际美股交易日期展示。过期数据仅供历史背景参考；未取得最近完整交易日数据时，不据此认定当日联动。[S6]</p>',
       "SCENARIO_TABLE_HTML":html_table(["情景","核心假设","触发条件","指数确认","宽度确认","失效条件","观察倾向"],[["偏强","成长风格止跌","创业板指收复MA20","沪深300不再创新低","涨停增加且炸板率下降","成交额继续萎缩","观察科技/高端制造"],["震荡/基准","板块轮动延续","指数在前收附近震荡","中证500相对稳定","涨跌停分化","权重与成长同步下破","等待主线确认"],["偏弱","风险偏好继续下降","沪深300与创业板同步走弱","成交额放大下跌","跌停增加、昨日涨停溢价转负","出现政策/公告反转","降低事件暴露"]]),"NEXT_SESSION_WATCHLIST_HTML":'<ul><li>成交额是否放大并得到上涨家数确认。</li><li>涨停梯队、炸板率和昨日涨停表现是否改善。</li><li>科技与高端制造代表股是否重新站上MA20。</li></ul>',
       "FINAL_CONCLUSION_HTML":f'<p class="lead">今日A股更接近<strong>板块轮动与风险偏好分化</strong>：指数方向、成交额代理、涨停梯队和代表股篮子需要联合观察。新闻提供潜在催化剂，但公告与资金口径仍是主要验证点。[S1][S3][S4]</p>',"SECTOR_SUMMARY_HTML":html_table(["类型","行业/主题","事实依据","资金方向口径","下一交易日验证"],[["相对强势",sec[0]["name"] if sec else "未取得","代表股篮子日/5日表现","价格/成交量代理","是否继续跑赢沪深300"],["相对弱势",sec[-1]["name"] if sec else "未取得","代表股篮子日/5日表现","价格/成交量代理","是否出现放量下破"],["重点关注","科技与高端制造","新闻候选+固定池异动","不是实际净流入","创业板指与成交额确认"]]),"MARKET_STAGE":"板块轮动","POSITIONING_BIAS_HTML":'<p>不追逐单日异动，等待成交额、宽度、公告和技术位置共同确认。</p>',"VALIDATION_SIGNALS_HTML":'<ol><li>如果上涨家数和成交额同步改善，那么结构性修复才有确认。</li><li>如果创业板指重新站上MA20，那么成长主线的持续性增强。</li><li>如果涨停增加且炸板率下降，那么短线赚钱效应改善。</li><li>如果昨日涨停池平均表现转负，那么题材持续性需要降级。</li><li>如果指数与成长风格同步跌破关键均线，那么今日轮动判断被推翻。</li></ol>',
-      "EVIDENCE_LIMITATIONS_HTML":'<ul><li>东财板块排名/资金流接口本次出现连接风控时，行业表现使用代表股等权代理。</li><li>全市场直接涨跌家数、融资融券横截面和预约披露日历未完整取得。</li><li>盘中阶段已使用5分钟K重建；财联社和RSS时间戳仍主要是发布时间，未取得事件真实发生时间或官方文件时不称为已确认驱动。</li></ul>',"SOURCES_HTML":sources,
+      "EVIDENCE_LIMITATIONS_HTML":('<ul><li>本页为盘中快照，价格、成交额、涨跌停池和板块排名仍可能变化。</li><li>均线与RSI以此前完整交易日为基础；龙虎榜和收盘后公告未纳入。</li><li>财联社和RSS时间戳主要是发布时间，时间对齐不证明价格因果。</li></ul>' if is_intraday else '<ul><li>东财板块排名/资金流接口本次出现连接风控时，行业表现使用代表股等权代理。</li><li>全市场直接涨跌家数、融资融券横截面和预约披露日历未完整取得。</li><li>盘中阶段已使用5分钟K重建；财联社和RSS时间戳仍主要是发布时间，未取得事件真实发生时间或官方文件时不称为已确认驱动。</li></ul>'),"SOURCES_HTML":sources,
     }
-    # Keep optional global linkage because the existing US evidence pack is available.
-    out=REPORTS/f"A股收盘日报_{report_date}_Asia-Shanghai.html"
+    values["EVIDENCE_LIMITATIONS_HTML"] += (
+        '<p class="note">所有行情按报告日期与截止时间筛选。历史回放使用不复权日K重建收盘价，'
+        '盘中可用已完成5分钟K重建价格；成交额、换手率、盘中量比、资金流及涨跌停池'
+        '缺少截止前快照时显示“未取得”。各报价实际观测时间与重建来源见 evidence.json。</p>'
+    )
+    out=(REPORTS/f"A股盘中快报_{report_date}_{as_of:%H%M}.html" if is_intraday
+         else REPORTS/f"A股收盘日报_{report_date}_Asia-Shanghai.html")
     render_template(TEMPLATE, values, out, strict=True)
+    if is_intraday:
+        render_template(TEMPLATE, values, REPORTS/"A股盘中快报_latest.html", strict=True)
     print(f"Wrote {out}")
     return out
 
 def run(context):
+    cache_seconds = int(
+        context.config.get("markets", {}).get("cn", {}).get("intraday_cache_seconds", 120)
+    )
     report_path = Path(main(
         context.report_date,
+        mode=context.mode,
+        as_of=context.as_of if context.as_of_explicit else None,
+        refresh=context.refresh,
+        cache_seconds=cache_seconds,
         template=context.template,
         reports_dir=context.reports_dir,
         runs_dir=context.runs_dir,
