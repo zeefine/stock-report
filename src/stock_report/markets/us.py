@@ -211,9 +211,13 @@ def main(
         data["mover_scope"]="fixed_pool_historical_snapshot"
     # Secondary pull for every mover shown in the正文 table: keep regular and
     # after-hours prices separate, and leave unavailable values explicitly blank.
-    for x in (data.get("gainers",[])[:8] + data.get("losers",[])[:8]):
-        s=x.get("symbol")
-        if s and s not in after:
+    mover_symbols = dict.fromkeys(x.get("symbol") for x in
+                                 data.get("gainers",[])[:8] + data.get("losers",[])[:8]
+                                 if x.get("symbol"))
+    for s in mover_symbols:
+        if not data.get(s, {}).get("rows"):
+            data[s] = chart(s, "2y", "1d", False)
+        if s not in after:
             d=chart(s,"5d","5m",True); rows=d.get("rows",[])
             after[s]=_after_hours_close(d)
     data["after"] = after
@@ -247,7 +251,7 @@ def render(data, events):
     movers=[]
     for label,key in [("涨幅", "gainers"),("跌幅","losers")]:
         for x in data.get(key,[])[:8]:
-            s=x.get("symbol") or ""; d=DATA.get(s) or chart(s,"3mo","1d",False); z=technical(d)
+            s=x.get("symbol") or ""; z=technical(data.get(s) or {})
             movers.append((label,s,x.get("shortName") or x.get("longName") or "",z.get("close"),z.get("day"),z.get("vol_ratio"),data.get("after",{}).get(s)))
     movers_html=table(["方向","代码","名称","收盘","日变动","量比","盘后"],[[lab,s,html.escape(n)[:48],fmt(c),sign_html(ch),fmt(v,2,"x"),fmt(ah)] for lab,s,n,c,ch,v,ah in movers])
     # fixed pool technical table

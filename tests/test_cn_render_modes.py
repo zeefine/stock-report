@@ -116,6 +116,10 @@ class CnRenderModeTests(unittest.TestCase):
             evidence = json.loads((data / "evidence.json").read_text(encoding="utf-8"))
             self.assertEqual(evidence["report_type"], "close")
             self.assertTrue(evidence["is_final"])
+            assessment = evidence["market_assessment"]
+            self.assertEqual(assessment["valid_core_count"], 4)
+            self.assertIn(assessment["status"], output.read_text(encoding="utf-8"))
+            self.assertIn("sector_coverage", assessment)
             self.assertEqual(output.name, "A股收盘日报_2026-08-03_Asia-Shanghai.html")
             self.assertNotIn("{{", output.read_text(encoding="utf-8"))
         finally:

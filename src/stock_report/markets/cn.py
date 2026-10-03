@@ -13,6 +13,7 @@ try:
 except ModuleNotFoundError:  # defensive fallback for standalone module execution
     _technical_snapshot = None
 from stock_report.news import load_news_events
+from stock_report.analysis import cn_market_assessment
 from stock_report.render import html_table as _shared_html_table, render_template
 from stock_report.common import (
     cn_session_state, cn_timestamp, cn_close_quote_errors, cn_close_minute_checks, cn_close_price_mismatches,
@@ -1147,10 +1148,12 @@ def main(
                     cutoff_policy="timestamped quotes; eligible snapshots; K-line reconstruction; otherwise missing")
     cross_market = us_reference(DATA_ROOT.parent, as_of)
     evidence["cross_market"] = cross_market
+    assessment = cn_market_assessment(tq, tech, SECTOR_BASKETS, as_of, mode)
+    evidence["market_assessment"] = assessment
     (data_dir/"evidence.json").write_text(json.dumps(evidence,ensure_ascii=False,indent=2))
-    return render(report_date,now,tq,eq,tech,kl,inds,flow_ind,flow_con,zt,zb,dt,yzt,lhb,ev,announcements_pack,news_dir,data_dir,intraday_section,quality,timestamped_events_pack,mode=mode,as_of=as_of,limit_pool_available=limit_pool_available,cross_market=cross_market)
+    return render(report_date,now,tq,eq,tech,kl,inds,flow_ind,flow_con,zt,zb,dt,yzt,lhb,ev,announcements_pack,news_dir,data_dir,intraday_section,quality,timestamped_events_pack,mode=mode,as_of=as_of,limit_pool_available=limit_pool_available,cross_market=cross_market,assessment=assessment)
 
-def render(report_date,now,tq,eq,tech,kl,inds,flow_ind,flow_con,zt,zb,dt,yzt,lhb,ev,announcements_pack,news_dir,data_dir,intraday_section,quality,timestamped_events_pack,*,mode="close",as_of=None,limit_pool_available=True,cross_market=None):
+def render(report_date,now,tq,eq,tech,kl,inds,flow_ind,flow_con,zt,zb,dt,yzt,lhb,ev,announcements_pack,news_dir,data_dir,intraday_section,quality,timestamped_events_pack,*,mode="close",as_of=None,limit_pool_available=True,cross_market=None,assessment=None):
     as_of = (as_of or now).astimezone(SH_TZ)
     is_intraday = mode == "intraday"
     price_label = "最新价" if is_intraday else "收盘"
@@ -1169,13 +1172,33 @@ def render(report_date,now,tq,eq,tech,kl,inds,flow_ind,flow_con,zt,zb,dt,yzt,lhb
         z=q(s); t=tech.get(s,{})
         idxrows.append([f"<strong>{n}</strong><br><span class='muted'>{s[-6:]}</span>",fmt_num(z.get("price"),2),fmt_pct(z.get("change_pct")),fmt_num(z.get("high"),2)+" / "+fmt_num(z.get("low"),2),fmt_amount_wan(z.get("amount_wan")),fmt_pct(t.get("r5")),fmt_pct(t.get("r20")),ma20_state(t)])
     market_html=html_table(["标的",price_label,"涨跌","日内高/低","成交额","5日","20日","技术状态"],idxrows)
-    # Representative sector baskets, used when board index endpoint is unavailable.
-    sec=[]
-    for name,members in SECTOR_BASKETS.items():
-        vals=[tech.get(c,{}) for c in members if tech.get(c,{}).get("day") is not None]
-        sec.append({"name":name,"day":sum(v["day"] for v in vals)/len(vals) if vals else None,"r5":sum(v.get("r5") or 0 for v in vals)/len(vals) if vals else None,"n":len(vals)})
-    sec.sort(key=lambda x:x["day"] if x["day"] is not None else -999,reverse=True)
-    sector_html=html_table(["排名","代表股篮子","当日平均","5日平均","口径"],[[i+1,x["name"],fmt_pct(x["day"]),fmt_pct(x["r5"]),"代表股等权代理"] for i,x in enumerate(sec)])
+    assessment = assessment or cn_market_assessment(tq, tech, SECTOR_BASKETS, as_of, mode)
+    sec = assessment["sectors"]
+    status = assessment["status"] + ("（盘中，待收盘确认）" if is_intraday else "")
+    focus = "、".join(assessment["focus"]) or "暂无符合条件的正收益领先篮子"
+    if len(sec) < 2:
+        sector_note = f'数据不足：合格篮子 {len(sec)}/{len(SECTOR_BASKETS)}，取消强弱排名和重点方向判断。'
+    elif not assessment["sector_ranked"]:
+        sector_note = "合格篮子收益相同，不按配置顺序选择强弱或重点方向。"
+    else:
+        sector_note = f'仅比较 {len(sec)}/{len(SECTOR_BASKETS)} 个合格代表股篮子，不代表全行业排名或资金流向。'
+    sector_html=html_table(["排名","代表股篮子","当日平均","5日平均（收盘口径）","有效成分"],
+                           [[x["rank"] if x["rank"] is not None else "不排名",html.escape(x["name"]),
+                             fmt_pct(x["day"]),fmt_pct(x["r5"]),f'{x["n"]}/{x["total"]}'] for x in sec])
+    sector_html += ('<p class="note">'+html.escape(sector_note)
+                    +' 篮子有效门槛：至少2只且覆盖率≥50%；5日收益缺失不填零。[S1]</p>')
+    summary_rows = [[label, html.escape(row["name"]), fmt_pct(row["day"]),
+                     f'{row["n"]}/{row["total"]}', "代表股等权价格代理，非资金流"]
+                    for label, group in (("相对强势", assessment["leaders"]), ("相对弱势", assessment["laggards"]))
+                    for row in group]
+    sector_summary = (html_table(["类型","代表股篮子","当日平均","有效成分","口径"], summary_rows)
+                      if summary_rows else "") + '<p>'+html.escape(sector_note)+'</p>'
+    sector_summary += '<p>重点观察：'+html.escape(focus)+'。</p>'
+    core_values = [value for value in assessment["core_changes"].values() if value is not None]
+    core_note = (f'有效核心报价 {len(core_values)}/4；上涨 {sum(v > 0 for v in core_values)}、'
+                 f'下跌 {sum(v < 0 for v in core_values)}、持平 {sum(v == 0 for v in core_values)}。')
+    core_note += ("数据不足，暂停市场方向判断。" if len(core_values) < 4
+                  else "仅描述核心指数方向，不据此认定全市场普涨普跌、风险偏好或资金流向。")
     flow_note="已取得板块主力净流入字段" if flow_ind else "行业资金流接口未取得，以下使用代表股价格/成交量代理"
     if flow_ind:
         sector_html=html_table(["排名","行业","当日涨跌","主力净流入","主力净占比","领涨股"],[[i+1,x.get("name"),fmt_pct(x.get("change")),fmt_money_yi(x.get("main_net")),fmt_pct(x.get("main_pct")),html.escape(str(x.get("leader") or "未取得"))] for i,x in enumerate(flow_ind[:15])])
@@ -1245,8 +1268,8 @@ def render(report_date,now,tq,eq,tech,kl,inds,flow_ind,flow_con,zt,zb,dt,yzt,lhb
     values={
       "REPORT_DATE_SHANGHAI":report_date,"MARKET_PHASE":"A股盘中快报" if is_intraday else "A股收盘复盘","GENERATED_AT_SHANGHAI":now.strftime("%Y-%m-%d %H:%M:%S Asia/Shanghai"),"DATA_AS_OF":as_of.strftime("%Y-%m-%d %H:%M Asia/Shanghai"),"SESSION_SCOPE":"盘中快照，数据未经收盘确认" if is_intraday else "集合竞价、上午盘、下午盘；收盘后公告单独标注",
       "SSE_CLOSE":fmt_num(q0.get("price")),"SSE_CHANGE":fmt_pct(q0.get("change_pct")),"CSI300_CLOSE":fmt_num(q3.get("price")),"CSI300_CHANGE":fmt_pct(q3.get("change_pct")),"CHINEXT_CLOSE":fmt_num(qg.get("price")),"CHINEXT_CHANGE":fmt_pct(qg.get("change_pct")),"TOTAL_TURNOVER":fmt_amount_wan(turnover),"TURNOVER_CHANGE":f'<span class="muted">成交额变化：未取得同口径前值</span>',
-      "FIRST_READ_HTML":''.join(f'<div class="decision"><small>{a}</small><strong>{b}</strong></div>' for a,b in [("核心变化","指数与成长风格是否同步"),("主线",""+sec[0]["name"] if sec else "未取得"),("已反映/待验证","价格先行，公告与资金需验证"),("下一验证点","成交额、宽度与涨停梯队")]),
-      "EXECUTIVE_SUMMARY_HTML":f'<p class="lead">{report_date} A股{"截至 "+as_of.strftime("%H:%M") if is_intraday else "收盘"}：上证指数 {fmt_pct(q0.get("change_pct"))}，沪深300 {fmt_pct(q3.get("change_pct"))}，创业板指 {fmt_pct(qg.get("change_pct"))}；成交额以沪深指数成交额合计为代理。{"涨停"+str(len(zt))+"家、炸板"+str(len(zb))+"家、跌停"+str(len(dt))+"家。" if limit_pool_available else "涨跌停池未取得。"}{"以上均为盘中快照，未经收盘确认。" if is_intraday else ""}[S1][S3]</p>',"MARKET_STATUS":"盘中结构性分化/待收盘确认" if is_intraday else "结构性轮动/风险偏好分化",
+      "FIRST_READ_HTML":''.join(f'<div class="decision"><small>{a}</small><strong>{b}</strong></div>' for a,b in [("核心变化",status),("主线",html.escape(focus)),("已反映/待验证","价格先行，公告与资金需验证"),("下一验证点","成交额、宽度与涨停梯队")]),
+      "EXECUTIVE_SUMMARY_HTML":f'<p class="lead">{report_date} A股{"截至 "+as_of.strftime("%H:%M") if is_intraday else "收盘"}：上证指数 {fmt_pct(q0.get("change_pct"))}，沪深300 {fmt_pct(q3.get("change_pct"))}，创业板指 {fmt_pct(qg.get("change_pct"))}；成交额以沪深指数成交额合计为代理。{"涨停"+str(len(zt))+"家、炸板"+str(len(zb))+"家、跌停"+str(len(dt))+"家。" if limit_pool_available else "涨跌停池未取得。"}{"以上均为盘中快照，未经收盘确认。" if is_intraday else ""}[S1][S3]</p>',"MARKET_STATUS":status,
       "MARKET_OVERVIEW_TABLE_HTML":market_html,"RISK_APPETITE_HTML":f'<p class="note">以沪深300、中证1000、创业板指、涨跌停与炸板率联合判断风险偏好；全市场直接涨跌家数本次未取得。[S1][S3]</p>',
       "INTRADAY_SECTION_HTML":intraday_section,
       "MACRO_LIQUIDITY_TABLE_HTML":macro_table,"CROSS_ASSET_TABLE_HTML":cross_html,"MACRO_EVENTS_HTML":macro_html,
@@ -1256,8 +1279,11 @@ def render(report_date,now,tq,eq,tech,kl,inds,flow_ind,flow_con,zt,zb,dt,yzt,lhb
       "DISCLOSURE_RECAP_TABLE_HTML":disclosure_html,"EVENT_CALENDAR_TABLE_HTML":future_html,"EARNINGS_ANALYSIS_HTML":'<p>本版未取得可统一核验的未来3个交易日预约披露明细；不将媒体标题写成正式业绩事实。</p>',
       "POSITIONING_SIGNALS_HTML":f'<p>报告日龙虎榜记录 {len(lhb)} 条；融资融券、股东户数和大宗交易本次未做全市场横截面补充，避免把单项数据当作全市场资金结论。[S5]</p>',"EVENT_ANALYSIS_HTML":'<p>重大事件只保留原始新闻候选，需以公司公告、交易所文件或监管材料二次核验。[S4]</p>',
       "UZI_CANDIDATES_HTML":'<p><strong>重点观察：</strong>'+"、".join(f"{q(c).get('name') or c}（{c}）" for c in selected[:5])+"。</p>","GLOBAL_LINKAGE_HTML":'<p>跨市场参考按各资产实际美股交易日期展示。过期数据仅供历史背景参考；未取得最近完整交易日数据时，不据此认定当日联动。[S6]</p>',
-      "SCENARIO_TABLE_HTML":html_table(["情景","核心假设","触发条件","指数确认","宽度确认","失效条件","观察倾向"],[["偏强","成长风格止跌","创业板指收复MA20","沪深300不再创新低","涨停增加且炸板率下降","成交额继续萎缩","观察科技/高端制造"],["震荡/基准","板块轮动延续","指数在前收附近震荡","中证500相对稳定","涨跌停分化","权重与成长同步下破","等待主线确认"],["偏弱","风险偏好继续下降","沪深300与创业板同步走弱","成交额放大下跌","跌停增加、昨日涨停溢价转负","出现政策/公告反转","降低事件暴露"]]),"NEXT_SESSION_WATCHLIST_HTML":'<ul><li>成交额是否放大并得到上涨家数确认。</li><li>涨停梯队、炸板率和昨日涨停表现是否改善。</li><li>科技与高端制造代表股是否重新站上MA20。</li></ul>',
-      "FINAL_CONCLUSION_HTML":f'<p class="lead">今日A股更接近<strong>板块轮动与风险偏好分化</strong>：指数方向、成交额代理、涨停梯队和代表股篮子需要联合观察。新闻提供潜在催化剂，但公告与资金口径仍是主要验证点。[S1][S3][S4]</p>',"SECTOR_SUMMARY_HTML":html_table(["类型","行业/主题","事实依据","资金方向口径","下一交易日验证"],[["相对强势",sec[0]["name"] if sec else "未取得","代表股篮子日/5日表现","价格/成交量代理","是否继续跑赢沪深300"],["相对弱势",sec[-1]["name"] if sec else "未取得","代表股篮子日/5日表现","价格/成交量代理","是否出现放量下破"],["重点关注","科技与高端制造","新闻候选+固定池异动","不是实际净流入","创业板指与成交额确认"]]),"MARKET_STAGE":"板块轮动","POSITIONING_BIAS_HTML":'<p>不追逐单日异动，等待成交额、宽度、公告和技术位置共同确认。</p>',"VALIDATION_SIGNALS_HTML":'<ol><li>如果上涨家数和成交额同步改善，那么结构性修复才有确认。</li><li>如果创业板指重新站上MA20，那么成长主线的持续性增强。</li><li>如果涨停增加且炸板率下降，那么短线赚钱效应改善。</li><li>如果昨日涨停池平均表现转负，那么题材持续性需要降级。</li><li>如果指数与成长风格同步跌破关键均线，那么今日轮动判断被推翻。</li></ol>',
+      "SCENARIO_TABLE_HTML":html_table(["情景","核心假设","触发条件","指数确认","宽度确认","失效条件","观察倾向"],[["偏强","成长风格止跌","创业板指收复MA20","沪深300不再创新低","涨停增加且炸板率下降","成交额继续萎缩","观察已取得数据的领先篮子"],["震荡/基准","板块轮动延续","指数在前收附近震荡","中证500相对稳定","涨跌停分化","权重与成长同步下破","等待主线确认"],["偏弱","风险偏好继续下降","沪深300与创业板同步走弱","成交额放大下跌","跌停增加、昨日涨停溢价转负","出现政策/公告反转","降低事件暴露"]]),"NEXT_SESSION_WATCHLIST_HTML":'<ul><li>成交额是否放大并得到上涨家数确认。</li><li>涨停梯队、炸板率和昨日涨停表现是否改善。</li><li>重点观察篮子能否延续相对表现；缺数据时先补齐证据。</li></ul>',
+      "FINAL_CONCLUSION_HTML":f'<p class="lead">市场状态：<strong>{status}</strong>。{core_note}[S1]</p>',
+      "SECTOR_SUMMARY_HTML":sector_summary,"MARKET_STAGE":status,
+      "POSITIONING_BIAS_HTML":'<p>重点观察：'+html.escape(focus)+'。不将样本排名直接转化为交易或仓位建议。</p>',
+      "VALIDATION_SIGNALS_HTML":'<ol><li>核验四个核心指数同日数据是否齐全。</li><li>观察指数方向是否得到全市场宽度和成交额确认。</li><li>比较合格篮子下一时段相对表现，不以缺失值排序。</li><li>新闻催化需以公告和价格反应分别核验。</li></ol>',
       "EVIDENCE_LIMITATIONS_HTML":('<ul><li>本页为盘中快照，价格、成交额、涨跌停池和板块排名仍可能变化。</li><li>均线与RSI以此前完整交易日为基础；龙虎榜和收盘后公告未纳入。</li><li>财联社和RSS时间戳主要是发布时间，时间对齐不证明价格因果。</li></ul>' if is_intraday else '<ul><li>东财板块排名/资金流接口本次出现连接风控时，行业表现使用代表股等权代理。</li><li>全市场直接涨跌家数、融资融券横截面和预约披露日历未完整取得。</li><li>盘中阶段已使用5分钟K重建；财联社和RSS时间戳仍主要是发布时间，未取得事件真实发生时间或官方文件时不称为已确认驱动。</li></ul>'),"SOURCES_HTML":sources,
     }
     values["EVIDENCE_LIMITATIONS_HTML"] += (
